@@ -237,11 +237,21 @@ def main() -> None:
     st.set_page_config(page_title="ASEKE BTC Lab", page_icon="₿", layout="wide")
     profiles = load_profiles()
     with st.sidebar:
+        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas"), key="workspace")
+        if view == "Research / Learning":
+            from lab.learning.dashboard import panel
+        elif view == "Trade ideas":
+            from lab.phase10.dashboard import panel
+        else:
+            panel = None
         st.header("Research profile")
         key = st.radio("Strategy profile", list(profiles), format_func=lambda item: profiles[item].label,
                        label_visibility="collapsed", key="profile")
         st.button("Scalping · Coming later", disabled=True)
         st.caption("Charts and reports use America/Toronto display time. Session and data boundaries use UTC.")
+    if panel is not None:
+        panel()
+        return
     profile = profiles[key]
     st.title("ASEKE BTC Lab")
     st.caption("Local development research · Coinbase Exchange BTC-USD · Unlevered spot")

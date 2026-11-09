@@ -140,3 +140,28 @@ From the project directory in PowerShell
 ```
 
 Use the [collector runbook](PHASE2_RUNBOOK.md) for unattended registration, explicit resume, persistent stop and rollback.
+
+## Controlled learning
+
+```powershell
+./learning.ps1 status
+./learning.ps1 run-once
+./learning.ps1 report
+```
+
+Use the dashboard's **Research / Learning** view or the [learning runbook](LEARNING_RUNBOOK.md) for controls, data requirements, and evidence. The original observer stays separate.
+
+## KuCoin reference and manual ideas
+
+```powershell
+./phase9.ps1 status
+./phase9.ps1 decide --collect
+./phase9.ps1 run-once
+./phase9.ps1 report
+```
+
+The dashboard's **Trade ideas** view uses the same local controls. Use the [Phase 9 runbook](PHASE9_KUCOIN_RUNBOOK.md) for public downloads, imports, campaign gates, and the manual workflow.
+
+## Background KuCoin monitoring
+
+`./phase10.ps1 status` shows worker ownership, scheduled work, independent controls, and futures readiness. See [the Phase 10 runbook](PHASE10_RUNBOOK.md) for Windows commissioning, local operation, and research bundle requirements.

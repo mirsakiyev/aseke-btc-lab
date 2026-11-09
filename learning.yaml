@@ -1,0 +1,124 @@
+version: phase8-first-study-v1
+seed: 308
+budget:
+  wall_seconds: 7200
+  max_threads: 2
+  child_rss_mib: 640
+  min_available_ram_mib: 1250
+  min_free_disk_mib: 2048
+  output_cap_mib: 256
+  max_native_rows: 650000
+  daily_check_seconds: 86400
+  max_attempts_per_trial: 2
+profiles:
+  position_spot_research_v1:
+    instrument: coinbase_btc_usd_spot_v1
+    decision: 1D
+    context: [{frame: 7D, sma: 20}]
+    execution_seconds: 3600
+    max_hold_minutes: 43200
+    long_only: true
+    interval_days: 30
+    minimum_new_mature: 10
+    primary_cost: spot_conservative_v1
+    risk: spot_equal_risk_v1
+  swing_perp_research_v1:
+    instrument: linear_usdt_perp_v1
+    decision: 4h
+    context: [{frame: 1D, sma: 200}]
+    execution_seconds: 60
+    max_hold_minutes: 10080
+    long_only: false
+    interval_days: 7
+    minimum_new_mature: 20
+    primary_cost: perp_published_api_v1
+    risk: perp_equal_risk_v1
+  day_perp_research_v1:
+    instrument: linear_usdt_perp_v1
+    decision: 15min
+    context: [{frame: 1h, sma: 50}, {frame: 4h, sma: 50}]
+    execution_seconds: 60
+    max_hold_minutes: 480
+    entry_cutoff_minute_utc: 1320
+    flat_minute_utc: 1435
+    long_only: false
+    interval_days: 1
+    minimum_new_mature: 40
+    primary_cost: perp_published_api_v1
+    risk: perp_equal_risk_v1
+instruments:
+  coinbase_btc_usd_spot_v1:
+    family: spot
+    source: coinbase_exchange:spot:BTC-USD
+    quote: USD
+    base_per_contract: 1
+    quantity_step: 0.00000001
+    price_tick: 0.01
+    min_contracts: 0.00000001
+    tier_notional: 10000000
+    max_leverage: 1
+    maintenance_rate: 0
+    liquidation_fee_rate: 0
+    rule_evidence: Research rounding convention, no historical venue constraint claim.
+  linear_usdt_perp_v1:
+    family: linear_perp
+    source: SYNTHETIC:BTC-USDT-LINEAR
+    quote: USDT
+    base_per_contract: 0.001
+    quantity_step: 1
+    price_tick: 0.1
+    min_contracts: 1
+    tier_notional: 100000
+    max_leverage: 100
+    maintenance_rate: 0.005
+    liquidation_fee_rate: 0.003
+    rule_evidence: Fictional single-tier rule for simulator diagnostics only.
+costs:
+  spot_conservative_v1: {taker_bps: 50, adverse_bps: 5, evidence: Inherited Coinbase research reference}
+  spot_lower_fee_v1: {taker_bps: 5, adverse_bps: 5, evidence: Hypothetical published MEXC spot fees on Coinbase prices}
+  perp_published_api_v1:
+    maker_bps: 6
+    taker_bps: 8
+    adverse_bps: 5
+    fee_channel: API
+    effective_utc: '2026-06-01T08:00:00Z'
+    evidence: PUBLISHED_UNVERIFIED_FOR_ACCOUNT
+    announcement: https://www.mexc.com/announcements/article/updates-to-api-futures-trading-fees-jun-1-2026-17827791535742
+    confirmation: https://www.mexc.com/learn/article/mexc-fees-explained-complete-trading-futures-withdrawal-fees-guide/1
+    discrepancy: The announcement example uses the older rates. The updated table and newer official guide agree.
+risk:
+  spot_equal_risk_v1: {starting_equity: 10000, risk_fraction: 0.0025, notional_cap: 0.25, leverage: 1, ordinary_cap: 1, liquidation_buffer_atr: 0}
+  perp_equal_risk_v1: {starting_equity: 10000, risk_fraction: 0.0025, notional_cap: 1, leverage: 3, ordinary_cap: 5, liquidation_buffer_atr: 0.5}
+strategies:
+  breakout_v1: {prior_range: 20}
+  pullback_v1: {prior_retracement_atr: 0.5}
+  range_reversion_v1: {context_abs_max: 0.08, deviation_atr: 1.25}
+exits:
+  fixed_r_v1: {initial_atr: 2, target_r: 2}
+  atr_trail_v1: {initial_atr: 2, trailing_atr: 2.5}
+models:
+  rules_v1: {type: unfiltered}
+  ridge_v1: {type: ridge, alpha: 1.0, minimum_train: 35}
+  hist_v1: {type: hist, max_iter: 35, max_leaf_nodes: 7, max_depth: 3, min_samples_leaf: 12, learning_rate: 0.08, l2_regularization: 1.0, early_stopping: false, minimum_train: 80}
+evaluation:
+  train_start: '2018-01-01T00:00:00Z'
+  folds:
+    - {id: y2023, inner_start: '2022-07-01T00:00:00Z', outer_start: '2023-01-01T00:00:00Z', outer_end: '2024-01-01T00:00:00Z'}
+    - {id: y2024, inner_start: '2023-07-01T00:00:00Z', outer_start: '2024-01-01T00:00:00Z', outer_end: '2025-01-01T00:00:00Z'}
+    - {id: y2025, inner_start: '2024-07-01T00:00:00Z', outer_start: '2025-01-01T00:00:00Z', outer_end: holdout_start}
+  minimum_inner: 10
+  minimum_outer: 10
+  minimum_trades_for_uncertainty: 25
+  monthly_block_bootstrap_samples: 500
+  threshold_net_r: 0.0
+  development_improvement: Complete filtered folds and resolved account, descriptive net-R lower interval above zero, return above cash and matching rules.
+  challenger_selection: none_for_consumed_first_study
+execution:
+  version: closed-input-ioc-onebar-v1
+  processing_seconds: 30
+  entry_limit_atr: 0.25
+  label_equity: 10000
+  funding_reserve_bps: 10
+  leverage_stress: [1, 2, 3, 5, 10, 20, 50, 100]
+  stresses: [double_cost, delayed_entry_exit, gap, adverse_funding, fair_last_divergence, partial_rejected, outage]
+  external_signal: {enabled: false, contract: timestamped_entitled_signal_v1}

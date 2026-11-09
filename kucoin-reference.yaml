@@ -1,0 +1,83 @@
+version: kucoin-reference-v1
+execution_mode: MANUAL_OUTSIDE_LAB
+reference_venue: KuCoin
+research_parent_manifest: 420565f0a2939f3a5b44c180af70999ed799db3d7b8076c4033cbe4630b293b5
+access_report: User reports KuCoin is accessible and works for them.
+execution_eligibility: UNVERIFIED
+personal_fees: UNVERIFIED
+validation: No validated model
+profiles:
+  position:
+    parent: position_spot_research_v1
+    venue: KuCoin
+    trade_type: SPOT
+    symbol: BTC-USDT
+    quote: USDT
+    fee: kucoin_spot_class_a_vip0_v1
+    warmup_interval: 1day
+    warmup_bars: 168
+    idea_ttl_minutes: 60
+  swing:
+    parent: swing_perp_research_v1
+    venue: KuCoin
+    trade_type: FUTURES
+    symbol: XBTUSDTM
+    quote: USDT
+    fee: kucoin_linear_perp_vip0_v1
+    warmup_interval: 4hour
+    warmup_bars: 1260
+    idea_ttl_minutes: 45
+  day:
+    parent: day_perp_research_v1
+    venue: KuCoin
+    trade_type: FUTURES
+    symbol: XBTUSDTM
+    quote: USDT
+    fee: kucoin_linear_perp_vip0_v1
+    warmup_interval: 15min
+    warmup_bars: 880
+    idea_ttl_minutes: 10
+fees:
+  kucoin_spot_class_a_vip0_v1:
+    maker: 0.001
+    taker: 0.001
+    adverse_proxy: 0.0005
+    required_class: classA
+  kucoin_linear_perp_vip0_v1:
+    maker: 0.0002
+    taker: 0.0006
+    adverse_proxy: 0.0005
+fee_evidence:
+  basis: PUBLISHED_REFERENCE_UNVERIFIED_FOR_ACCOUNT
+  source: https://www.kucoin.com/support/48142946141636
+  source_last_updated: '2026-07-16'
+  checked_utc_date: '2026-11-09'
+  discounts: none_assumed
+ideas:
+  version: kucoin-manual-breakout-v1
+  family: breakout_v1
+  exit: fixed_r_v1
+  completed_candle_grace_seconds: 40
+  maximum_quote_age_seconds: 120
+  maximum_quote_clock_skew_seconds: 1
+  maximum_metadata_age_hours: 24
+  modeled_liquidation_fee: 0.003
+  manual_delay_diagnostic:
+    status: PREREGISTERED_NOT_RUN
+    additional_native_bars: [1, 2]
+    scope: Compare same frozen idea on later available bars with the original entry range and expiry.
+acquisition:
+  metadata_max_requests: 5
+  probe_max_requests: 13
+  current_max_requests: 17
+  quotes_max_requests: 4
+  extended_max_requests: 10
+  history_max_requests: 24
+  timeout_seconds: 10
+  minimum_spacing_seconds: 0.35
+  maximum_response_bytes: 2097152
+  maximum_local_bytes: 268435456
+  maximum_import_rows: 650000
+  futures_intraday_history_from: '2025-01-01T00:00:00Z'
+  spot_page_bars: 1500
+  futures_page_bars: 200
