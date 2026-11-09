@@ -177,3 +177,7 @@ Use `./phase12.ps1 status` and `./phase12.ps1 report` for the complete-history v
 ## Frozen futures comparison and new KuCoin evidence
 
 Use `./phase13.ps1 status` and `./phase13.ps1 report` for the frozen Day and Swing comparisons and the separate KuCoin observation study. The [Phase 13 runbook](PHASE13_RUNBOOK.md) covers the exact pins, receipt-based offline replay, and observation controls.
+
+## Feature context and amended KuCoin cohort
+
+Use `./phase14.ps1 verify` and `./phase14.ps1 technical-review` to check managed observation, feature readiness, and the amended cohort. The [Phase 14 runbook](PHASE14_RUNBOOK.md) records the narrow feature-only exception, UTC and Toronto dates, and outcome gates.

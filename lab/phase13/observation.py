@@ -33,7 +33,7 @@ def encode(data):
 
 
 def directory(protocol):
-    return ROOT / "observations" / protocol["id"]
+    return protocol.get("storage_root", ROOT) / "observations" / protocol["id"]
 
 
 def db_open(protocol, readonly=False):
@@ -67,7 +67,7 @@ def scheduled_due(now=None):
 
 
 def schedule(protocol, wake):
-    write_json(PULSE, {"protocol": protocol["id"], "wake": wake.isoformat()})
+    write_json(PULSE, {"protocol": protocol.get("pulse_id", protocol["id"]), "wake": wake.isoformat()})
 
 
 def counters(db):
@@ -113,8 +113,8 @@ def save_metadata(db, now):
             "record": rules}
 
 
-def observe(*, launcher="operator", transport=None, now=None):
-    protocol = active()
+def observe(*, launcher="operator", transport=None, now=None, study=None, after_horizon=None):
+    protocol = study if study is not None else active()
     if not protocol:
         raise ValueError("Register the future-data study first")
     if not control()["enabled"]:
@@ -126,6 +126,7 @@ def observe(*, launcher="operator", transport=None, now=None):
     due = target_boundary(now, protocol)
     step = pd.Timedelta(minutes=policy["step_minutes"])
     grace = pd.Timedelta(seconds=policy["close_grace_seconds"])
+    park = after_horizon if after_horizon is not None else horizon + pd.Timedelta(days=3650)
     if due <= start:
         schedule(protocol, start.ceil(step) + grace if start.ceil(step) > start else start + step + grace)
         return {"state": "WAITING_FOR_FIRST_CLOSED_WINDOW", "protocol": protocol["id"], "start": body["start"]}
@@ -133,7 +134,7 @@ def observe(*, launcher="operator", transport=None, now=None):
     with writer_lock(root / ".capture.lock"), closing(db_open(protocol)) as db:
         last = db.execute("SELECT max(boundary) FROM cycle WHERE state IN ('COMPLETE','PARTIAL_FINAL')").fetchone()[0]
         if last and utc(last) >= horizon:
-            schedule(protocol, horizon + pd.Timedelta(days=3650))
+            schedule(protocol, park)
             return {"state": "PRIMARY_COLLECTION_ENDED", **counters(db)}
         if last and utc(last) >= due:
             schedule(protocol, min(due + step, horizon) + grace)
@@ -156,7 +157,7 @@ def observe(*, launcher="operator", transport=None, now=None):
         if attempt >= policy["max_attempts_per_boundary"]:
             db.execute("UPDATE cycle SET state='PARTIAL_FINAL' WHERE boundary=?", (boundary,))
             db.commit()
-            schedule(protocol, min(due + step, horizon) + grace)
+            schedule(protocol, min(due + step, horizon) + grace if due < horizon else park)
             return {"state": "PARTIAL_FINAL", "reason": "Frozen boundary attempts consumed", **counters(db)}
         saved_meta = save_metadata(db, now)
         expected = int((due - left).total_seconds() // 60)
@@ -218,7 +219,7 @@ def observe(*, launcher="operator", transport=None, now=None):
             phase = stop
             wake = horizon + pd.Timedelta(days=3650)
         elif report["coverage_complete"] and (funding_ok or not funding_due):
-            phase, wake = "COMPLETE", min(due + step, horizon) + grace if due < horizon else horizon + pd.Timedelta(days=3650)
+            phase, wake = "COMPLETE", min(due + step, horizon) + grace if due < horizon else park
         elif attempt >= policy["max_attempts_per_boundary"] or stop == "RESOURCE_LIMIT":
             phase, wake = "PARTIAL_FINAL", max(now + pd.Timedelta(seconds=60), min(due + step, horizon) + grace)
         else:

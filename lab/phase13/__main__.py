@@ -44,7 +44,7 @@ def main():
         from lab.phase13 import protocol
         result = protocol.register() if name == "register" else protocol.set_control(args.state == "on")
     elif name in ("observe-once", "_observe"):
-        from lab.phase13.observation import observe
+        from lab.phase14.collection import managed_observe
         launcher = "operator"
         if name == "_observe":
             import psutil
@@ -55,7 +55,7 @@ def main():
             if worker["pid"] not in ancestors or worker["launch_id"] != args.worker_launch:
                 raise ValueError("Managed observation requires the current task worker as its ancestor")
             launcher = f"{worker['launcher']}:{worker['launch_id']}"
-        result = observe(launcher=launcher)
+        result = managed_observe(launcher)
     else:
         from pathlib import Path
         import pandas as pd
