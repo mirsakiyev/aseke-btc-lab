@@ -404,6 +404,18 @@ class Worker:
                 creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS,
             )
 
+    def observe_registered_research(self):
+        from lab.phase13.observation import scheduled_due
+
+        active = getattr(self, "phase13_observer", None)
+        if (active is not None and active.poll() is None) or not scheduled_due():
+            return
+        self.phase13_observer = subprocess.Popen(
+            [sys.executable, "-X", "utf8", "-m", "lab.phase13", "_observe", self.rt["launch_id"]], cwd=ROOT,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS,
+        )
+
     def manage_active(self, quotes, now):
         for key, idea in list(self.rt.get("active", {}).items()):
             market = idea["market"] == "FUTURES"
@@ -536,6 +548,10 @@ def run(managed=False):
                             rt["last_error"] = {"at": utc_now().isoformat(), "reason": str(exc)}
                             rt["retry_at"] = (utc_now() + pd.Timedelta(seconds=30)).isoformat()
                             LOG.exception("KuCoin cycle failed")
+                        try:
+                            worker.observe_registered_research()
+                        except (ValueError, KeyError, OSError, RuntimeError):
+                            LOG.exception("Phase 13 observation launch failed")
                         worker.save()
                         for _ in range(POLL_SECONDS):
                             if controls()["paused"]:

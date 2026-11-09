@@ -41,7 +41,7 @@ def label_batch(design, data, trial):
     return setups, cost, training, records, metadata
 
 
-def account_replay(design, data, trial, batch, predictions, fold_versions):
+def account_replay(design, data, trial, batch, predictions, fold_versions, *, curve=None, executor=run_trade):
     setups, cost, _, _, _ = batch
     policy = design["settings"]["evaluation"]
     starting = cash = data["risk"].starting_equity
@@ -49,6 +49,8 @@ def account_replay(design, data, trial, batch, predictions, fold_versions):
     first = utc(design["folds"][0]["outer_start"])
     end = utc(design["folds"][-1]["outer_end"])
     available, ledger, marks, exposed, filter_counts = first, [], {first: cash}, set(), Counter()
+    if curve is not None:
+        curve.post(first, cash, False)
     unresolved = None
     for fold in design["folds"]:
         right = utc(fold["outer_end"])
@@ -68,25 +70,36 @@ def account_replay(design, data, trial, batch, predictions, fold_versions):
                 ledger.append({**asdict(setup), **version, "status": "SKIPPED", "reason": skip,
                                "selected_leverage": data["risk"].leverage, "order": None})
             else:
-                result = run_trade(market, setup, data["contract"], cost, data["risk"], cash, data["rules"], right,
-                                   trail_updates=data["trail"], keep_marks=True)
+                result = executor(market, setup, data["contract"], cost, data["risk"], cash, data["rules"], right,
+                                  trail_updates=data["trail"], keep_marks=True)
                 for mark_at, equity, holding in result.pop("marks", []):
-                    marks[mark_at] = equity
-                    if holding:
-                        exposed.add(mark_at)
+                    if curve is not None:
+                        curve.post(mark_at, equity, holding)
+                    else:
+                        marks[mark_at] = equity
+                        if holding:
+                            exposed.add(mark_at)
                 ledger.append({**result, **version})
                 if result["status"] in ("COMPLETE", "AMBIGUOUS"):
                     cash, available = result["ending_equity"], result["exit_at"]
-                    marks[available] = cash
+                    if curve is not None:
+                        curve.post(available, cash, False)
+                    else:
+                        marks[available] = cash
                 elif result.get("remaining_base"):
                     unresolved = result["reason"]
                     break
         if unresolved:
             break
-    final_mark = max(marks) if unresolved else end
-    observed = market.trade.close_at.loc[(market.trade.close_at >= first) & (market.trade.close_at <= final_mark)]
-    index = pd.DatetimeIndex(observed).union(pd.DatetimeIndex(marks.keys())).sort_values()
-    equity = pd.Series(marks, dtype=float).reindex(index).ffill()
+    if curve is not None:
+        equity = curve.equity(market, curve.latest if unresolved else end)
+        exposure_count = curve.exposure_count
+    else:
+        final_mark = max(marks) if unresolved else end
+        observed = market.trade.close_at.loc[(market.trade.close_at >= first) & (market.trade.close_at <= final_mark)]
+        index = pd.DatetimeIndex(observed).union(pd.DatetimeIndex(marks.keys())).sort_values()
+        equity = pd.Series(marks, dtype=float).reindex(index).ffill()
+        exposure_count = len(exposed)
     closed = [row for row in ledger if row["status"] in ("COMPLETE", "AMBIGUOUS")]
     total_net = sum(row["net"] for row in closed)
     top = sum(sorted((row["net"] for row in closed if row["net"] > 0), reverse=True)[:5])
@@ -102,7 +115,7 @@ def account_replay(design, data, trial, batch, predictions, fold_versions):
         "unresolved_reason": unresolved, "starting_equity": starting, "ending_observed_equity": float(equity.iloc[-1]),
         "return": float(equity.iloc[-1] / starting - 1) if not unresolved else None,
         "drawdown_observed_marks": float((equity / equity.cummax() - 1).min()), "observed_equity_marks": len(equity),
-        "exposure_fraction_of_observed_marks": len(exposed) / len(equity),
+        "exposure_fraction_of_observed_marks": exposure_count / len(equity),
         "closed_trades": len(closed), "total_realized_net": total_net,
         "net_expectancy": total_net / len(closed) if closed else None,
         "mean_net_r": float(np.mean([row["net_r"] for row in closed])) if closed else None,

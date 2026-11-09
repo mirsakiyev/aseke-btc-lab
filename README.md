@@ -165,3 +165,15 @@ The dashboard's **Trade ideas** view uses the same local controls. Use the [Phas
 ## Background KuCoin monitoring
 
 `./phase10.ps1 status` shows worker ownership, scheduled work, independent controls, and futures readiness. See [the Phase 10 runbook](PHASE10_RUNBOOK.md) for Windows commissioning, local operation, and research bundle requirements.
+
+## Bounded historical futures campaign
+
+Use `./phase11.ps1 status` and `./phase11.ps1 report` for the versioned workload, archive coverage, and qualification. The [Phase 11 runbook](PHASE11_RUNBOOK.md) explains the independent resource amendment and bounded run/resume commands.
+
+## Complete-history futures amendment
+
+Use `./phase12.ps1 status` and `./phase12.ps1 report` for the complete-history view, variant eligibility, and isolated historical run. The [Phase 12 runbook](PHASE12_RUNBOOK.md) describes the preregistered cutoff and resume conditions.
+
+## Frozen futures comparison and new KuCoin evidence
+
+Use `./phase13.ps1 status` and `./phase13.ps1 report` for the frozen Day and Swing comparisons and the separate KuCoin observation study. The [Phase 13 runbook](PHASE13_RUNBOOK.md) covers the exact pins, receipt-based offline replay, and observation controls.
