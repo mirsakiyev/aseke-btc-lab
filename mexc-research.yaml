@@ -1,0 +1,49 @@
+version: mexc-spot-research-v1
+eligibility:
+  residency_country_context: CA
+  locality_context: Toronto
+  terms_url: https://www.mexc.com/terms
+  terms_revision: 2026-10-13
+  checked_on: 2026-11-08
+  additional_eligibility_evidence: null
+published:
+  name: mexc_published_spot_taker_research
+  intended_venue: MEXC
+  product: spot
+  market_type: unlevered_spot
+  proposed_symbol: BTCUSDT
+  proposed_pair_confirmed: false
+  proposed_quote_currency: USDT
+  maker_fee_bps: 0
+  taker_fee_bps: 5
+  simulated_entry_liquidity: taker
+  simulated_exit_liquidity: taker
+  mx_deduction_enabled: false
+  mx_balance_eligibility_verified: false
+  promotional_zero_fee_assumed: false
+  execution_channel: unconfirmed
+  fee_provenance: official_published_standard
+  account_pair_channel_fee_verified: false
+  combined_adverse_price_proxy_bps_per_side: 5
+  adverse_proxy_provenance: inherited_hypothetical_assumption
+  standard_source: https://www.mexc.com/learn/article/how-to-use-mx-for-trading-fee-discounts/1
+  standard_published_on: 2026-11-07
+  fee_overview: https://www.mexc.com/fee
+  checked_on: 2026-11-08
+  promotion_source: https://www.mexc.com/announcements/article/update-on-ongoing-0-spot-fees-offer-17827791533330
+  promotion_published_on: 2026-01-28
+  promotion_scope_effective_on: 2026-02-01
+  promotion_expires_on: null
+  promotional_api_users_eligible: false
+account_fee_evidence: null
+matching_data:
+  adapter_version: mexc-spot-v3-offline-v1
+  access: offline
+  coverage: INSUFFICIENT_DATA
+  advertised_archive_start: 2023-01-01
+  observed_start: null
+  observed_end: null
+  observed_gap_count: null
+  snapshot_sha256: null
+  live_schema_verified: false
+  bucket_grid_verified: false

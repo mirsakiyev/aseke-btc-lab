@@ -1,0 +1,54 @@
+position_spot:
+  <<: &baseline
+    entry_range: 20
+    exit_range: 10
+    atr_period: 14
+    atr_multiple: 2
+    starting_cash: 10000
+    risk: 0.0025
+    allocation: 0.25
+    ridge_alpha: 1
+    min_train: 20
+    min_eval: 5
+    costs: {fee_bps: 50, proxy_bps: 5, processing_seconds: 30, delay_bars: 0}
+  label: Spot / Position
+  version: "1"
+  decision: 1D
+  execution: 1h
+  context:
+    - {frame: 7D, average: sma, slow: 20}
+  holding_label: 7–30 days
+  max_minutes: 43200
+  momentum_period: 7
+  volume_period: 20
+  min_train_days: 365
+
+swing:
+  <<: *baseline
+  label: Swing
+  version: "1"
+  decision: 4h
+  execution: 1h
+  context:
+    - {frame: 1D, average: sma, slow: 200}
+  holding_label: 1–7 days
+  max_minutes: 10080
+  momentum_period: 6
+  volume_period: 30
+  min_train_days: 180
+
+day:
+  <<: *baseline
+  label: Day
+  version: "1"
+  decision: 15min
+  execution: 5min
+  context:
+    - {frame: 1h, average: ema, fast: 20, slow: 50}
+    - {frame: 4h, average: ema, slow: 50}
+  holding_label: 30 minutes–8 hours
+  max_minutes: 480
+  session: {cutoff_minute_utc: 1320, flat_minute_utc: 1435}
+  momentum_period: 4
+  volume_period: 32
+  min_train_days: 60
