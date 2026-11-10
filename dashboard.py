@@ -237,11 +237,15 @@ def main() -> None:
     st.set_page_config(page_title="ASEKE BTC Lab", page_icon="₿", layout="wide")
     profiles = load_profiles()
     with st.sidebar:
-        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas"), key="workspace")
+        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas", "Challenger learning", "Native learning readiness"), key="workspace")
         if view == "Research / Learning":
             from lab.learning.dashboard import panel
         elif view == "Trade ideas":
-            from lab.phase10.dashboard import panel
+            from lab.phase15.dashboard import panel
+        elif view == "Challenger learning":
+            from lab.phase16.dashboard import panel
+        elif view == "Native learning readiness":
+            from lab.phase17.dashboard import panel
         else:
             panel = None
         st.header("Research profile")

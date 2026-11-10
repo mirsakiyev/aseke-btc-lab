@@ -55,7 +55,47 @@ def main():
             if worker["pid"] not in ancestors or worker["launch_id"] != args.worker_launch:
                 raise ValueError("Managed observation requires the current task worker as its ancestor")
             launcher = f"{worker['launcher']}:{worker['launch_id']}"
-        result = managed_observe(launcher)
+        from lab.storage import RUNS
+        native = None
+        try:
+            if name == "_observe" and (RUNS / "phase17" / "registration.json").exists():
+                from lab.phase17.registry import registered
+                native = registered()
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            from lab.storage import utc_now, write_json
+            write_json(RUNS / "phase17" / "managed-error.json", {"at": utc_now().isoformat(), "reason": str(error)})
+        if native:
+            from lab.phase17.collection import price_observe
+            result = price_observe(native, launcher)
+        else:
+            result = managed_observe(launcher)
+        if name == "_observe":
+            from lab.phase15.catalog import ROOT as paper_root
+            if (paper_root / "registration.json").exists():
+                try:
+                    from lab.phase15.worker import cycle as paper_cycle
+                    paper_cycle(launcher, source_cycle=result,
+                                allow_spot=result.get("stop_reason") not in {"RATE_LIMITED", "ACCESS_RESTRICTED"}
+                                and result.get("state") not in {"RETRY_AFTER", "ACCESS_RESTRICTED", "COLLECTION_OFF"})
+                except Exception as error:
+                    from lab.storage import utc_now, write_json
+                    write_json(paper_root / "managed-error.json", {"at": utc_now().isoformat(), "launcher": launcher,
+                                                                  "type": type(error).__name__, "reason": str(error)})
+            if native:
+                try:
+                    from lab.phase17.managed import tick
+                    tick(native, launcher, result)
+                except (KeyError, OSError, RuntimeError, ValueError) as error:
+                    from lab.storage import utc_now, write_json
+                    write_json(RUNS / "phase17" / "managed-error.json", {"at": utc_now().isoformat(), "reason": str(error)})
+            challenger_controls = RUNS / "phase16" / "controls.json"
+            try:
+                if challenger_controls.exists() and read_json(challenger_controls).get("recurring"):
+                    from lab.phase16.control import managed_tick
+                    managed_tick()
+            except (OSError, RuntimeError, ValueError) as error:
+                from lab.storage import utc_now, write_json
+                write_json(RUNS / "phase16" / "dispatch-error.json", {"at": utc_now().isoformat(), "reason": str(error)})
     else:
         from pathlib import Path
         import pandas as pd

@@ -181,3 +181,15 @@ Use `./phase13.ps1 status` and `./phase13.ps1 report` for the frozen Day and Swi
 ## Feature context and amended KuCoin cohort
 
 Use `./phase14.ps1 verify` and `./phase14.ps1 technical-review` to check managed observation, feature readiness, and the amended cohort. The [Phase 14 runbook](PHASE14_RUNBOOK.md) records the narrow feature-only exception, UTC and Toronto dates, and outcome gates.
+
+## Explainable trade opportunities and paper books
+
+Open **Trade ideas** in the dashboard or use `./phase15.ps1 verify` and `./phase15.ps1 report`. The [Phase 15 runbook](PHASE15_RUNBOOK.md) explains the live rules, the separate Swing trailing experiment, and how the paper accounts handle fills and funding.
+
+## Controlled challenger learning
+
+Open **Challenger learning** in the existing dashboard or run `./phase16.ps1 status` and `./phase16.ps1 report`. The [Phase 16 runbook](PHASE16_RUNBOOK.md) describes the frozen comparisons, mature-label gates, and independent allocation and training controls.
+
+## Phase 17 KuCoin-native learning inputs
+
+Open **Native learning readiness** or run `./phase17.ps1 status` and `./phase17.ps1 report`. The [Phase 17 runbook](PHASE17_RUNBOOK.md) records the frozen native allocation, collection, receipt-time label policy, and Phase 16 eligibility commands.
