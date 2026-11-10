@@ -155,7 +155,7 @@ def results(profile, manifest: dict, directory) -> None:
         st.dataframe(pd.DataFrame(rows), width="stretch")
 
 
-@st.fragment(run_every="15s")
+@st.fragment(run_every="30s")
 def forward_panel(profile) -> None:
     with st.expander("Forward research", expanded=True):
         current = collector_status()
@@ -237,7 +237,8 @@ def main() -> None:
     st.set_page_config(page_title="ASEKE BTC Lab", page_icon="₿", layout="wide")
     profiles = load_profiles()
     with st.sidebar:
-        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas", "Challenger learning", "Native learning readiness"), key="workspace")
+        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas", "Challenger learning",
+                                     "Native learning readiness", "Operational health"), key="workspace")
         if view == "Research / Learning":
             from lab.learning.dashboard import panel
         elif view == "Trade ideas":
@@ -246,6 +247,8 @@ def main() -> None:
             from lab.phase16.dashboard import panel
         elif view == "Native learning readiness":
             from lab.phase17.dashboard import panel
+        elif view == "Operational health":
+            from lab.health.panel import panel
         else:
             panel = None
         st.header("Research profile")
