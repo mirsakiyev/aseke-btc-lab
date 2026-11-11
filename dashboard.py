@@ -238,7 +238,7 @@ def main() -> None:
     profiles = load_profiles()
     with st.sidebar:
         view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas", "Challenger learning",
-                                     "Native learning readiness", "Operational health"), key="workspace")
+                                     "Native learning readiness", "Operational health", "Strategy Library / Research Lab"), key="workspace")
         if view == "Research / Learning":
             from lab.learning.dashboard import panel
         elif view == "Trade ideas":
@@ -249,6 +249,8 @@ def main() -> None:
             from lab.phase17.dashboard import panel
         elif view == "Operational health":
             from lab.health.panel import panel
+        elif view == "Strategy Library / Research Lab":
+            from lab.strategy_lab.dashboard import panel
         else:
             panel = None
         st.header("Research profile")

@@ -193,3 +193,7 @@ Open **Challenger learning** in the existing dashboard or run `./phase16.ps1 sta
 ## Phase 17 KuCoin-native learning inputs
 
 Open **Native learning readiness** or run `./phase17.ps1 status` and `./phase17.ps1 report`. The [Phase 17 runbook](PHASE17_RUNBOOK.md) records the frozen native allocation, collection, receipt-time label policy, and Phase 16 eligibility commands.
+
+## Strategy Library and Research Lab
+
+See the [Strategy Library and Research Lab runbook](STRATEGY_LAB_RUNBOOK.md) for the versioned registry, source import, bounded historical replay, comparison, and disabled prospective proposals.
