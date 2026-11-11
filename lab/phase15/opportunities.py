@@ -10,6 +10,7 @@ from lab.phase9.ideas import current_rules, frame_digest, fresh, timedelta_age
 from lab.phase9.public import INTERVALS
 from lab.phase10.worker import OUTPUT, cache_read, decision_key
 from lab.phase15.catalog import STEP
+from lab.phase15.paper import fixed_target
 from lab.storage import read_json, utc
 
 
@@ -30,8 +31,7 @@ def price_summary(order, setup, contract, cost):
     side, bound = setup.direction, order.limit_price
     stop = quantize(setup.stop, contract.price_tick, side < 0)
     base = order.contracts * contract.base_per_contract
-    target = (quantize(bound+side*setup.target_r*abs(bound-stop), contract.price_tick, side > 0)
-              if setup.target_r else None)
+    target = fixed_target(bound, stop, setup.target_r, side, contract.price_tick)
 
     def stop_loss(model):
         executable = fill_price(stop, -side, contract, model)

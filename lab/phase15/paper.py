@@ -1,5 +1,6 @@
 from collections import Counter
 from dataclasses import asdict
+from decimal import Decimal
 import json
 from math import isfinite
 
@@ -12,6 +13,13 @@ from lab.storage import utc
 
 
 PRICE = ("open", "high", "low", "close")
+
+
+def fixed_target(entry, stop, target_r, side, tick):
+    if not target_r:
+        return None
+    entry, stop, target_r = (Decimal(str(value)) for value in (entry, stop, target_r))
+    return quantize(entry + side * target_r * abs(entry - stop), tick, side > 0)
 
 
 def initial(lane):
@@ -125,8 +133,7 @@ def open_at(db, book, trade, mark, at, now):
     deadline = at+pd.Timedelta(minutes=plan["max_hold_minutes"])
     if plan["session_flat"]:
         deadline = min(deadline, utc(plan["session_flat"]))
-    target = (quantize(price+side*plan["target_r"]*abs(price-plan["stop"]), contract.price_tick, side > 0)
-              if plan["target_r"] else None)
+    target = fixed_target(price, plan["stop"], plan["target_r"], side, contract.price_tick)
     record = {**idea, "entry_at": at.isoformat(), "raw_entry": trade["open"], "entry_fee": fee, "entry_cash": book["cash"],
               "stop": plan["stop"], "target": target, "deadline": deadline.isoformat(), "last_trail": None,
               "planned_risk": order.planned_risk*contracts/order.contracts, "position": asdict(pos), "last_mark": mark["open"]}

@@ -8,7 +8,7 @@ from lab.config import fingerprint
 from lab.execution import execution_open
 from lab.learning.data import Market, validate_prices
 from lab.learning.evaluation import candidates, prepare
-from lab.learning.simulator import Cost, run_trade as spot_trade
+from lab.learning.simulator import Cost, Risk, run_trade as spot_trade
 from lab.phase9.ideas import current_rules
 from lab.phase9.reference import parent_design, reference
 from lab.phase10.partition import Chunk, PartitionedMarket
@@ -178,7 +178,14 @@ def label(record, snapshot, *, feature_builder=None, decision_start=None):
         validate_prices(bars, HOUR)
         market = Market(bars, bars, {}, HOUR, "HYPOTHETICAL_REPLAY")
         trade_receipts = mark_receipts = bars.received_at
-        data = prepare(design, trial["profile"], market, asdict(contract))
+        if feature_builder is None:
+            data = prepare(design, trial["profile"], market, asdict(contract))
+        else:
+            # A short prospective slice may have no complete higher-timeframe
+            # bars of its own. The admitted seed supplies feature context.
+            profile = settings["profiles"][trial["profile"]]
+            data = {"market": market, "profile": profile, "rules": settings["execution"],
+                    "contract": contract, "risk": Risk(**settings["risk"][profile["risk"]])}
     else:
         market = PartitionedMarket(chunks, {}, end, record["body"]["budget"]["max_native_rows"])
         trade_receipts, mark_receipts = (pd.concat(receipts[key]) for key in ("trade", "mark"))

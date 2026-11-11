@@ -96,16 +96,18 @@ def test_telegram_connect_failure_remains_retryable(monkeypatch):
     assert result.state == "RETRY" and "test-secret" not in result.detail
 
 
-def test_saved_phase15_publication_once_and_no_watch_signals(ledger, tmp_path, monkeypatch):
+@pytest.mark.parametrize("fixed_target", [None, 110])
+def test_saved_phase15_publication_once_and_no_watch_signals(ledger, tmp_path, monkeypatch, fixed_target):
     monkeypatch.setattr(catalog, "ROOT", tmp_path / "paper")
     now = utc("2026-11-10T17:00:00Z")
     epoch = int(now.timestamp())
     lane = {"profile": "swing", "mode": {"symbol": "XBTUSDTM"}, "risk": {"starting_equity": 1000}, "book_id": "fixture"}
     analysis = {"state": "ELIGIBLE_CONDITIONAL_IDEA", "source_cutoff": now.isoformat(), "direction": "LONG",
-                "strategy_version": "fixture-v1", "exit_policy": "trailing",
+                "strategy_version": "fixture-v1", "exit_policy": "trailing" if fixed_target is None else "fixed_r_v1",
                 "plan": {"eligible_from": "2026-11-10T17:01:00Z", "entry_expiry": "2026-11-10T17:15:00Z",
-                         "entry": {"trigger": 100, "minimum": 99, "maximum": 101}, "stop": 95, "fixed_target": None,
-                         "trailing_atr": 2, "max_hold_minutes": 720}}
+                         "entry": {"trigger": 100, "minimum": 99, "maximum": 101}, "stop": 95, "fixed_target": fixed_target,
+                         "target_r": 2 if fixed_target is not None else None, "trailing_atr": 2 if fixed_target is None else None,
+                         "max_hold_minutes": 720}}
     sent = []
 
     def send(message):
@@ -128,7 +130,9 @@ def test_saved_phase15_publication_once_and_no_watch_signals(ledger, tmp_path, m
             state.flush(db, checked, state.policy(), send)
             assert state.status(db)["delivery_counts"] == {"DELIVERED": 1}
     assert len(sent) == 1
-    assert all(value in sent[0] for value in (idea["id"], "XBTUSDTM", "99–101", "ATR trailing (2)", "EST", "fixture-v1"))
+    exit_rule = ("ATR trailing (2)" if fixed_target is None else
+                 "Illustrative 2R target 110. Recomputed from the modeled fill.")
+    assert all(value in sent[0] for value in (idea["id"], "XBTUSDTM", "99–101", exit_rule, "EST", "fixture-v1"))
 
 
 def test_independent_check_detects_stopped_worker(ledger, monkeypatch):

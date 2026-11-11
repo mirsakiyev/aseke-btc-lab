@@ -172,7 +172,10 @@ def phase14(db,now,amendment,collection,findings):
 def idea_text(lane,idea):
     plan=idea["plan"]
     entry=plan["entry"]
-    designation=(f"fixed target {plan['fixed_target']}" if plan["fixed_target"] is not None else f"ATR trailing ({plan['trailing_atr']})")
+    designation = (
+        f"Illustrative {plan['target_r']:g}R target {plan['fixed_target']}. Recomputed from the modeled fill."
+        if plan["fixed_target"] is not None else f"ATR trailing ({plan['trailing_atr']})"
+    )
     flat=f"; session flat {local(int(utc(plan['session_flat']).timestamp()))}" if plan.get("session_flat") else ""
     return (f"ASEKE BTC LAB — EXPERIMENTAL IDEA\n{lane['profile'].title()} / {idea['exit_policy']} · {lane['mode']['symbol']}\n"
             f"{idea['direction']} · Trigger {entry['trigger']} · Range {entry['minimum']}–{entry['maximum']}\n"

@@ -146,6 +146,28 @@ def test_fixed_target_and_ambiguous_paths_remain_distinct(state):
                 assert snapshot["recent_closed"][0]["reason"] == "target"
 
 
+def test_short_fixed_target_at_exact_price_tick(state):
+    at = utc("2026-11-10T03:45Z")
+    with closing(catalog.db_open()) as db:
+        book = paper.initial(state["day/fixed"])
+        draft = order_plan(at, direction=-1)
+        draft["plan"].update(
+            entry={"trigger": 74600.1, "minimum": 74355.6, "maximum": 74441.4},
+            stop=74742.0,
+            order=asdict(Order(42., 74355.6, 10000., 25., 24.68650968, 3., 98319.1, 23577.1)),
+        )
+        assert paper.publish(db, book, draft, at)
+        opened = at + catalog.STEP
+        assert tick(db, book, opened, bar(opened, 74418.5), bar(opened, 74420.62))
+        assert book["position"]["position"]["entry"] == 74381.2
+        assert book["position"]["target"] == 73659.6
+        next_at = opened + catalog.STEP
+        touch = bar(next_at, 73700., low=73659.6)
+        assert tick(db, book, next_at, touch, touch)
+        assert book["position"] is None
+        assert db.execute("SELECT 1 FROM event WHERE kind='CLOSED' AND json_extract(body, '$.reason')='target'").fetchone()
+
+
 def test_missing_funding_and_price_hold_the_durable_cursor(state, monkeypatch):
     at = utc("2026-11-09T23:58Z")
     lane = state["swing/fixed"]

@@ -115,7 +115,8 @@ def test_native_continuation_waits_for_protected_funding_closeout(tmp_path, monk
     assert utc(read_json(observation.PULSE)["wake"]) == now+collection.HOUR+collection.GRACE
 
 
-def test_spot_partitions_reach_frozen_features_and_real_labels(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seeded_first_day", [False, True])
+def test_spot_partitions_reach_frozen_features_and_real_labels(tmp_path, monkeypatch, seeded_first_day):
     monkeypatch.setattr(source, "ROOT", tmp_path)
     start = utc("2027-03-01T00:00Z")
     end = start+pd.Timedelta(days=220)
@@ -124,6 +125,9 @@ def test_spot_partitions_reach_frozen_features_and_real_labels(tmp_path, monkeyp
     mid = 10000 + 2.5*tick + 250*np.sin(tick/72)
     trade = pd.DataFrame({"open_at":hours, "close_at":hours+collection.HOUR, "open":mid-.3, "high":mid+1., "low":mid-1.,
                           "close":mid, "volume":4.+np.sin(tick/8), "received_at":hours+collection.HOUR+pd.Timedelta(seconds=50)})
+    if seeded_first_day:
+        end = start + pd.Timedelta(days=1)
+        trade = trade.loc[trade.open_at < end]
     partition = source.put_frame(trade)
     settings = config()
     name = "position_spot_research_v1"
@@ -142,6 +146,19 @@ def test_spot_partitions_reach_frozen_features_and_real_labels(tmp_path, monkeyp
                                              "start":start.isoformat(), "end_exclusive":end.isoformat(),
                                              "parts":[{"bases":{"trade":partition}}]}}
     record = {"body":{"profiles":{"position":cfg}}}
+    if seeded_first_day:
+        def seeded(data, receipts):
+            assert data["market"].index.equals(pd.DatetimeIndex(trade.open_at))
+            assert len(receipts) == 24
+            available = pd.Series([end + pd.Timedelta(seconds=50)], index=pd.DatetimeIndex([end]))
+            features = pd.DataFrame({"ready": [False], "atr": [1.], "uptrend": [False], "downtrend": [False],
+                                     "close": [100.], "prior_high": [101.], "prior_low": [99.]}, index=available.index)
+            return features, [], available, features.ready
+
+        _, _, (setups, _, mature, _, counts), _, _ = labels.label(record, native, feature_builder=seeded)
+        assert not setups and mature.empty
+        assert counts["feature_ready"] == counts["source_state"]["missing_trade"] == 0
+        return
     design, data, (setups, _, mature, records, counts), _, contract = labels.label(record, native)
     assert design["label_version"] == labels.VERSION and counts["feature_ready"] > 0 and len(setups) > 0
     assert len(mature) > 0 and (mature.mature_at < end).all()
