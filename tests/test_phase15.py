@@ -168,6 +168,83 @@ def test_short_fixed_target_at_exact_price_tick(state):
         assert db.execute("SELECT 1 FROM event WHERE kind='CLOSED' AND json_extract(body, '$.reason')='target'").fetchone()
 
 
+def test_watchdog_reads_committed_lifecycle_with_separate_books(state, tmp_path, monkeypatch):
+    from lab.health import monitor, paper_events, state as alerts
+    from lab.health.delivery import Delivery
+    from lab.storage import file_hash
+    import time
+
+    monkeypatch.setattr(alerts, "ROOT", tmp_path / "health")
+    at = utc("2026-11-11T14:30Z")
+    lanes = {lane["book_id"]: lane for lane in state.values()}
+    db_path = tmp_path / "paper.sqlite3"
+    cfg = alerts.policy()
+    sent = []
+
+    def deliver(text):
+        sent.append(text)
+        return Delivery("DELIVERED", "fixture", message_id=len(sent))
+
+    def draft(at):
+        result = order_plan(at, flat=at+4*catalog.STEP)
+        result["plan"].update(fixed_target=116, sizing={"equity":10000})
+        return result
+
+    def poll(now):
+        digest = file_hash(db_path)
+        with closing(catalog.db_open(readonly=True)) as source, alerts.connect() as outbox:
+            source.execute("BEGIN")
+            books = {key:paper.book_report(source,lane) for key,lane in state.items()}
+            monitor.publications(source,outbox,lanes,int(at.timestamp()),time.time())
+            baseline = paper_events.scan(source,outbox,"registration",lanes,books,now,cfg)
+            outbox.commit()
+            alerts.flush(outbox,time.time(),cfg,deliver)
+        assert file_hash(db_path) == digest
+        return baseline
+
+    day, swing = paper.initial(state["day/fixed"]), paper.initial(state["swing/fixed"])
+    with closing(catalog.db_open()) as db:
+        old = at-pd.Timedelta(days=1)
+        paper.publish(db,day,draft(old),old)
+        paper.expire(db,day,old+3*catalog.STEP,old+3*catalog.STEP,"Entry window elapsed")
+        db.commit()
+    assert poll(at)["baseline_rowid"] == 2
+    assert not sent
+    with closing(catalog.db_open()) as db:
+        day_idea = paper.publish(db,day,draft(at),at)
+        swing_idea = paper.publish(db,swing,draft(at),at)
+        paper.event(db,swing,"ENTRY_OBSERVED",swing_idea["id"],at+catalog.STEP,at+catalog.STEP,{})
+        paper.save(db,day)
+        paper.save(db,swing)
+        db.commit()
+    poll(at+catalog.STEP)
+    assert len(sent) == 2 and all("EXPERIMENTAL IDEA" in text for text in sent)
+    with closing(catalog.db_open()) as db:
+        at_fill = at+catalog.STEP
+        assert tick(db,day,at_fill)
+        paper.expire(db,swing,at+3*catalog.STEP,at+15*catalog.STEP,"Entry window elapsed")
+        paper.save(db,day)
+        paper.save(db,swing)
+        poll(at+20*catalog.STEP)
+        assert len(sent) == 2
+        db.commit()
+    poll(at+20*catalog.STEP)
+    assert "PAPER ENTRY CONFIRMED — DELAYED" in sent[2]
+    assert "Fill-based target 110.3" in sent[2] and "Illustrative" not in sent[2]
+    assert day_idea["id"] in sent[2] and "Day / fixed_r_v1" in sent[2]
+    assert "NO PAPER ENTRY" in sent[3] and "EXPIRED" in sent[3] and swing_idea["id"] in sent[3]
+    with closing(catalog.db_open()) as db:
+        for i in range(2,5):
+            assert tick(db,day,at+i*catalog.STEP)
+        paper.save(db,day)
+        db.commit()
+    poll(at+24*catalog.STEP)
+    poll(at+27*catalog.STEP)
+    assert len(sent) == 5
+    assert "SESSION FLAT (ledger time_exit)" in sent[4] and "included in gross" in sent[4]
+    assert "Updated paper equity" in sent[4] and "Accounting warning" not in sent[4]
+
+
 def test_missing_funding_and_price_hold_the_durable_cursor(state, monkeypatch):
     at = utc("2026-11-09T23:58Z")
     lane = state["swing/fixed"]

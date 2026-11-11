@@ -1,9 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib.util
 import logging
 from pathlib import Path
+from time import time as wall_time
 
 import httpx
+from lab.health.state import local
 
 
 @dataclass(frozen=True)
@@ -12,6 +14,10 @@ class Delivery:
     detail: str
     retry_after: int = 0
     message_id: int | None = None
+    request_started: float | None = None
+    request_completed: float | None = None
+    api_accepted_at: float | None = None
+    telegram_date: int | None = None
 
 
 def credentials():
@@ -28,6 +34,7 @@ def credentials():
 
 
 def send(message, *, transport=None):
+    started = None
     try:
         token, chat = credentials()
     except ValueError as exc:
@@ -38,14 +45,25 @@ def send(message, *, transport=None):
         logging.getLogger("httpx").disabled = True
         logging.getLogger("httpcore").setLevel(logging.WARNING)
         with httpx.Client(timeout=httpx.Timeout(5, connect=3), trust_env=False, follow_redirects=False, transport=transport) as client:
+            started = wall_time()
+            message = f"{message}\nTelegram request started {local(started)}"
             response = client.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id":chat,
                                    "text":message.replace(token,"[redacted]")[:4000], "link_preview_options":{"is_disabled":True}})
+            completed = wall_time()
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
-        return Delivery("RETRY", "Telegram connection failed before delivery")
+        return Delivery("RETRY", "Telegram connection failed before delivery",
+                        request_started=started, request_completed=wall_time() if started is not None else None)
     except httpx.HTTPError:
         # Telegram sendMessage has no idempotency key. A connection interrupted
         # after sending may have posted the message. Retain it for review.
-        return Delivery("UNCERTAIN", "Telegram response unavailable after transmission may have begun")
+        return Delivery("UNCERTAIN", "Telegram response unavailable after transmission may have begun",
+                        request_started=started, request_completed=wall_time() if started is not None else None)
+    result = classify_response(response)
+    return replace(result, request_started=started, request_completed=completed,
+                   api_accepted_at=completed if result.state == "DELIVERED" else None)
+
+
+def classify_response(response):
     try:
         payload = response.json()
     except ValueError:
@@ -59,7 +77,9 @@ def send(message, *, transport=None):
     if isinstance(payload, dict) and payload.get("ok") is True and response.status_code == 200:
         result = payload.get("result")
         if isinstance(result, dict) and type(result.get("message_id")) is int:
-            return Delivery("DELIVERED", "Telegram accepted the message", message_id=result["message_id"])
+            sent_at = result.get("date")
+            return Delivery("DELIVERED", "Telegram accepted the message", message_id=result["message_id"],
+                            telegram_date=sent_at if type(sent_at) is int and sent_at > 0 else None)
     if isinstance(payload, dict) and payload.get("ok") is False or 400 <= response.status_code < 500:
         return Delivery("RETRY", f"Telegram rejected request (HTTP {response.status_code})",
                         900 if response.status_code in (401, 403, 404) else 0)

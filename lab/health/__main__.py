@@ -12,7 +12,7 @@ import psutil
 
 from lab.health import dashboard_service as dashboard
 from lab.health.delivery import send
-from lab.health.state import ROOT, connect, enqueue, flush, get_meta, local, observe, policy, set_meta, set_policy, status
+from lab.health.state import DEFAULTS, ROOT, connect, enqueue, flush, get_meta, local, observe, policy, set_meta, set_policy, status
 from lab.storage import read_json, utc, utc_now, write_json, writer_lock
 
 
@@ -71,7 +71,7 @@ def check(*, deliver=True, mode="operator"):
         observe(db,findings,epoch,cfg)
         db.commit()
         if deliver:
-            flush(db,epoch,cfg,send)
+            flush(db,time.time(),cfg,send,clock=time.time)
         completed=utc_now()
         result={**evidence,"mode":mode,"completed_at":completed.isoformat(),"pid":os.getpid(),
                 "wall_seconds":round(time.monotonic()-before,2),"cpu_seconds":round(time.process_time()-cpu,2),
@@ -128,8 +128,9 @@ def stop_local():
 def main():
     parser=argparse.ArgumentParser(prog="aseke-health")
     sub=parser.add_subparsers(dest="command",required=True)
-    for name in ("status","alerts","test-telegram","dashboard-status","recover-dashboard","stop-local","task-status"):
+    for name in ("status","test-telegram","dashboard-status","recover-dashboard","stop-local","task-status"):
         sub.add_parser(name)
+    sub.add_parser("alerts").add_argument("--idea", help="Show delivery attempts for one full paper idea ID")
     run=sub.add_parser("check-once")
     run.add_argument("--no-send",action="store_true")
     mode = run.add_mutually_exclusive_group()
@@ -138,7 +139,10 @@ def main():
     sub.add_parser("audit").add_argument("start",nargs="?",default="2026-11-10T02:00:00Z")
     sub.add_parser("mute").add_argument("state",choices=("on","off"))
     cat=sub.add_parser("category")
-    cat.add_argument("category",choices=("health","ideas","training_completion")); cat.add_argument("state",choices=("on","off"))
+    cat.add_argument("category",choices=DEFAULTS["categories"]); cat.add_argument("state",choices=("on","off"))
+    interval = sub.add_parser("position-interval")
+    interval.add_argument("profile", choices=DEFAULTS["open_position_minutes"])
+    interval.add_argument("minutes", type=int, choices=range(1, 1441), metavar="1–1440")
     args=parser.parse_args()
     command=args.command
     if command=="check-once":
@@ -156,21 +160,23 @@ def main():
     elif command=="audit":
         from lab.health.monitor import overnight
         result=overnight(utc(args.start),utc_now())
-    elif command in {"alerts","test-telegram","mute","category"}:
+    elif command in {"alerts","test-telegram","mute","category","position-interval"}:
         with writer_lock(ROOT/".check.lock"),connect() as db:
             if command=="alerts":
-                result=status(db)
+                result=status(db,idea=args.idea)
             elif command=="mute":
                 result=set_policy(mute=args.state=="on")
             elif command=="category":
                 result=set_policy(categories={**policy()["categories"],args.category:args.state=="on"})
+            elif command=="position-interval":
+                result=set_policy(open_position_minutes={**policy()["open_position_minutes"],args.profile:args.minutes})
             else:
-                now=int(time.time())
+                now=time.time()
                 identifier="test:"+uuid4().hex
                 enqueue(db,identifier,"test",f"ASEKE BTC LAB — TEST NOTIFICATION\nIndependent watchdog delivery test.\n{local(now)}",now)
                 db.commit()
-                flush(db,now,policy(),send,only=identifier)
-                result=dict(db.execute("SELECT id,status,detail,delivered,message_id FROM outbox WHERE id=?",(identifier,)).fetchone())
+                flush(db,now,policy(),send,only=identifier,clock=time.time)
+                result=next(row for row in status(db)["recent_alerts"] if row["id"]==identifier)
     print(json.dumps(result,indent=2,default=str,allow_nan=False))
 
 

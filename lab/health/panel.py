@@ -6,7 +6,7 @@ from lab.storage import read_json, utc, utc_now
 
 
 def display_time(value):
-    return local(int(value)) if value is not None else "—"
+    return local(float(value)) if value is not None else "—"
 
 
 @st.fragment(run_every="30s")
@@ -53,8 +53,10 @@ def panel():
     cfg = policy()
     enabled = ", ".join(name.replace("_", " ") for name, active in cfg["categories"].items() if active)
     st.write(f"{'Muted' if cfg['mute'] else 'Enabled'} · Categories {enabled or 'none'}")
-    st.write(f"Last delivery {display_time(report['last_delivery'])} · Last recovery {display_time(report['last_recovery'])}")
+    st.write(f"Last recorded delivery {display_time(report['last_delivery'])} · Last recovery {display_time(report['last_recovery'])}")
     alerts = report["recent_alerts"]
     if alerts:
-        st.dataframe([{"Event": row["id"], "State": row["status"], "Recorded": display_time(row["created"]),
+        st.dataframe([{"Event": row["id"], "Category": row["category"], "State": row["status"],
+                       "Queued": display_time(row["created"]), "API success observed": display_time(row.get("api_accepted_at")),
+                       "Telegram message time": display_time(row.get("telegram_date")),
                        "Detail": row["detail"]} for row in alerts], hide_index=True, width="stretch")

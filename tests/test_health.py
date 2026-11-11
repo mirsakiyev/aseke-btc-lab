@@ -4,10 +4,12 @@ import sqlite3
 from types import SimpleNamespace
 
 import httpx
+import pandas as pd
 import psutil
 import pytest
 
 from lab.health import dashboard_service, delivery, monitor, state
+from lab.health import paper_events
 from lab.phase15 import catalog, paper
 from lab.storage import utc
 
@@ -96,6 +98,50 @@ def test_telegram_connect_failure_remains_retryable(monkeypatch):
     assert result.state == "RETRY" and "test-secret" not in result.detail
 
 
+def test_api_acceptance_records_actual_request_and_server_times(ledger, monkeypatch):
+    monkeypatch.setattr(delivery, "credentials", lambda: ("test-secret", "fixture-chat"))
+    times = iter((100.2, 100.7))
+    monkeypatch.setattr(delivery, "wall_time", lambda: next(times))
+
+    def post(request):
+        assert "Telegram request started" in request.content.decode()
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 42, "date": 100}})
+
+    clock = iter((100.1, 100.8))
+    with ledger() as db:
+        state.enqueue(db,"entry","paper_entry","fixture",99,idea_id="test-idea")
+        state.flush(db,100,state.policy(),lambda msg: delivery.send(msg, transport=httpx.MockTransport(post)),
+                    clock=lambda: next(clock))
+        row = state.status(db, idea="test-idea")["recent_alerts"][0]
+        assert (row["created"],row["dispatch_at"],row["request_started"],row["request_completed"],
+                row["delivered"],row["api_accepted_at"],row["telegram_date"],row["message_id"]) == (
+                    99,100.1,100.2,100.7,100.7,100.7,100,42)
+        assert row["attempt_history"][0]["api_accepted_at"] == 100.7
+
+
+def test_per_idea_retry_order_and_bound(ledger):
+    cfg = {**state.policy(), "telegram_max_attempts": 2}
+    sent = []
+
+    def send(text):
+        sent.append(text)
+        return delivery.Delivery("RETRY" if text == "entry" else "DELIVERED", "fixture")
+
+    with ledger() as db:
+        state.enqueue(db, "entry", "paper_entry", "entry", 10, idea_id="first")
+        state.enqueue(db, "exit", "paper_exit", "exit", 10, idea_id="first")
+        state.enqueue(db, "other", "paper_exit", "other", 10, idea_id="other")
+        state.flush(db,10,cfg,send)
+    with ledger() as db:
+        state.flush(db,11,cfg,send)
+        assert sent == ["entry", "other"]
+        state.flush(db,40,cfg,send)
+    with ledger() as db:
+        state.flush(db,41,cfg,send)
+        assert sent == ["entry", "other", "entry", "exit"]
+        assert state.status(db)["delivery_counts"] == {"DELIVERED":2,"FAILED":1}
+
+
 @pytest.mark.parametrize("fixed_target", [None, 110])
 def test_saved_phase15_publication_once_and_no_watch_signals(ledger, tmp_path, monkeypatch, fixed_target):
     monkeypatch.setattr(catalog, "ROOT", tmp_path / "paper")
@@ -133,6 +179,116 @@ def test_saved_phase15_publication_once_and_no_watch_signals(ledger, tmp_path, m
     exit_rule = ("ATR trailing (2)" if fixed_target is None else
                  "Illustrative 2R target 110. Recomputed from the modeled fill.")
     assert all(value in sent[0] for value in (idea["id"], "XBTUSDTM", "99–101", exit_rule, "EST", "fixture-v1"))
+
+
+@pytest.mark.parametrize(("code","reason"), [
+    ("ENTRY_OUTSIDE_FROZEN_RANGE","outside the frozen range"),
+    ("INSUFFICIENT_EXECUTABLE_CAPACITY","Insufficient executable capacity"),
+    (None,"Strategy invalidated explicitly"),
+])
+def test_terminal_unfilled_dedup(ledger, tmp_path, monkeypatch, code, reason):
+    monkeypatch.setattr(catalog,"ROOT",tmp_path/"paper")
+    now = utc("2026-11-11T14:31Z")
+    lane = {"profile":"day","mode":{"symbol":"XBTUSDTM"}}
+    lanes = {"book":lane}
+    with closing(catalog.db_open()) as source, ledger() as db:
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        book = {"book_id":"book"}
+        idea = {"id":"idea","exit_policy":"fixed_r_v1","direction":"SHORT","published_at":now.isoformat()}
+        paper.event(source,book,"PUBLISHED","idea",now,now,idea)
+        for delay in (1,2):
+            at = utc("2026-11-11T14:32Z") + pd.Timedelta(minutes=delay)
+            paper.event(source,book,"INVALIDATED","idea",at,at,
+                        {"reason":"Strategy invalidated explicitly","reason_code":code})
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        row = db.execute("SELECT text,event_json FROM outbox").fetchall()
+        assert len(row) == 1 and reason in row[0]["text"] and "09:31:00 EST" in row[0]["text"]
+
+
+def test_late_commit_resolves_orphan_close_in_fill_order(ledger, tmp_path, monkeypatch):
+    monkeypatch.setattr(catalog,"ROOT",tmp_path/"paper")
+    now = utc("2026-11-11T15:00Z")
+    earlier = utc("2026-11-11T14:32Z")
+    lane = {"profile":"day","mode":{"symbol":"XBTUSDTM"}}
+    lanes = {"book":lane}
+    book = {"book_id":"book"}
+    idea = {"id":"idea","exit_policy":"fixed_r_v1","direction":"SHORT","published_at":earlier.isoformat(),
+            "plan":{"stop":110,"target_r":2,"sizing":{"equity":1000}}}
+    closed = {"reason":"stop","entry_at":earlier.isoformat(),"exit_price":110,"holding_minutes":28,
+              "gross_price_pnl":-10,"fees":1,"funding":0,"liquidation_cost":0,"unfunded_deficit":0,
+              "net":-11,"net_r":-1.1,"adverse_cost_in_gross":.5,"equity_before":1000,"equity_after":989}
+    with closing(catalog.db_open()) as source, ledger() as db:
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        paper.event(source,book,"PUBLISHED","idea",earlier,earlier,idea)
+        paper.event(source,book,"CLOSED","idea",now,now,closed)
+        paper.event(source,book,"EXPIRED","idea",now,now,{"reason":"Entry window elapsed"})
+        source.commit()
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        assert not db.execute("SELECT 1 FROM outbox").fetchone()
+        db.commit()
+    with closing(catalog.db_open()) as source, ledger() as db:
+        paper.event(source,book,"HYPOTHETICAL_FILL","idea",earlier,earlier,
+                    {"price":100,"quantity":1,"planned_risk":10,"target":80,"stop":110})
+        source.commit()
+        paper_events.scan(source,db,"reg",lanes,{},now,state.policy())
+        assert [row[0] for row in db.execute("SELECT category FROM outbox ORDER BY rowid")] == ["paper_entry","paper_exit"]
+        assert "+0.0000" in db.execute("SELECT text FROM outbox WHERE category='paper_exit'").fetchone()[0]
+
+
+@pytest.mark.parametrize(("kind","label"), [
+    ("stop","STOP"),("target","TARGET"),("trailing_stop","TRAILING STOP"),("session_flat","SESSION FLAT"),
+])
+def test_saved_exit_kind_and_accounting_warning(kind,label):
+    t = "2026-11-11T15:00:00+00:00"
+    event = (2,"book","idea",t,t,"CLOSED","{}","event")
+    lane = {"profile":"swing","mode":{"symbol":"XBTUSDTM"}}
+    idea = {"exit_policy":"atr_trail_v1","direction":"SHORT"}
+    closed = {"reason":"stop","exit_kind":kind,"entry_at":t,"exit_price":105,"holding_minutes":60,
+              "gross_price_pnl":-10,"fees":2,"funding":1,"liquidation_cost":0,"unfunded_deficit":0,
+              "net":-11,"net_r":-.5,"adverse_cost_in_gross":.5,"equity_before":1000,"equity_after":989}
+    text,_ = paper_events.close_text(lane,idea,event,closed,{"price":100})
+    assert f"Exit {label}" in text and "Ledger net -11.00000000" in text and "989.0000" in text
+    assert "included in gross" in text
+    text,_ = paper_events.close_text(lane,idea,event,{**closed,"equity_after":999},{"price":100})
+    assert "Accounting warning" in text
+
+
+def test_open_position_updates_opt_in_and_expire_when_flat(ledger):
+    now = utc("2026-11-11T15:45Z")
+    cfg = state.policy()
+    lane = {"profile":"day","mode":{"symbol":"XBTUSDTM","trade_type":"FUTURES"}}
+    position = {"id":"idea","direction":"SHORT","exit_policy":"fixed_r_v1","entry_at":"2026-11-11T15:00Z",
+                "deadline":"2026-11-11T23:00Z","last_mark":101,"stop":110,
+                "mark_source_at":"2026-11-11T15:00Z","mark_received_at":"2026-11-11T15:01Z",
+                "position":{"entry":100,"remaining":.04}}
+    books = {"day":{"book_id":"book","position":position,"unrealized":-.04,"problem":None}}
+    with ledger() as db:
+        paper_events.open_updates(db,{"book":lane},books,now,cfg)
+        assert not db.execute("SELECT 1 FROM outbox").fetchone()
+        cfg["categories"]["open_position"] = True
+        for _ in range(2):
+            paper_events.open_updates(db,{"book":lane},books,now,cfg)
+        rows = db.execute("SELECT text,status FROM outbox").fetchall()
+        assert len(rows)==1 and "Stale or unverified at check" in rows[0]["text"]
+        books["day"]["position"] = None
+        paper_events.open_updates(db,{"book":lane},books,now,cfg)
+        assert db.execute("SELECT status FROM outbox").fetchone()[0]=="SUPERSEDED"
+
+
+def test_open_at_activation_is_reported_without_entry_alert(ledger, tmp_path, monkeypatch):
+    monkeypatch.setattr(catalog,"ROOT",tmp_path/"paper")
+    now = utc("2026-11-11T15:45Z")
+    record = {"id":"open-idea","direction":"SHORT","entry_at":"2026-11-11T15:00Z",
+              "position":{"entry":100,"remaining":.04}}
+    with closing(catalog.db_open()) as source, ledger() as db:
+        paper.event(source,{"book_id":"book"},"HYPOTHETICAL_FILL","open-idea",now,now,{})
+        source.commit()
+        baseline = paper_events.scan(source,db,"reg",{},{"day/fixed":{"position":record}},now,state.policy())
+        assert baseline["baseline_rowid"] == 1
+        assert baseline["open_at_activation"] == [{"book":"day/fixed","idea":"open-idea","direction":"SHORT",
+                                                    "entry_at":"2026-11-11T15:00Z","entry_price":100,"quantity":.04}]
+        assert not db.execute("SELECT 1 FROM outbox").fetchone()
 
 
 def test_independent_check_detects_stopped_worker(ledger, monkeypatch):

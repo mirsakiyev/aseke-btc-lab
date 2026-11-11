@@ -2,6 +2,7 @@ from contextlib import closing
 import json
 import shutil
 import sqlite3
+import time
 
 import pandas as pd
 import psutil
@@ -185,18 +186,24 @@ def idea_text(lane,idea):
 
 
 def publications(paper,db,lanes,started,now):
-    for row in paper.execute("SELECT book,idea,body FROM event WHERE kind='PUBLISHED' AND recorded_at>=? ORDER BY recorded_at",
+    for row in paper.execute("SELECT book,idea,key,source_at,recorded_at,body FROM event "
+                             "WHERE kind='PUBLISHED' AND recorded_at>=? ORDER BY recorded_at,rowid",
                              (pd.Timestamp(started,unit="s",tz="UTC").isoformat(),)):
-        book,identifier,document=row
+        book,identifier,key,source_at,recorded_at,document=row
         if book not in lanes:
             continue
         idea=json.loads(document)
         if idea["id"] != identifier or idea["direction"] not in {"LONG","SHORT"}:
             raise ValueError("Saved publication identity or direction is invalid")
-        enqueue(db,"idea:"+identifier,"ideas",idea_text(lanes[book],idea),now)
+        quotes = [idea["plan"].get(name) for name in ("quote_receipt","mark_receipt")]
+        event_json = json.dumps({"book_id": book, "event": "PUBLISHED", "event_key": key, "source_at": source_at,
+                                 "recorded_at": recorded_at, "latest_quote_received_at": max(
+                                     (quote["received_at"] for quote in quotes if quote), key=utc, default=None)})
+        enqueue(db,"idea:"+identifier,"ideas",idea_text(lanes[book],idea),now,idea_id=identifier,event_json=event_json)
 
 
-def paper(now,db,started,findings):
+def paper(now,db,started,cfg,findings):
+    from lab.health.paper_events import scan
     from lab.phase15.catalog import registered,controls,db_open
     from lab.phase15.paper import book_report
 
@@ -211,9 +218,12 @@ def paper(now,db,started,findings):
                 f"Phase 15 {key} switch is {'on' if ctl[key] else 'off'}.")
     books={}
     with closing(db_open(readonly=True)) as conn:
+        conn.execute("BEGIN")
         saved={row[0] for row in conn.execute("SELECT id FROM book")}
+        records = {}
         for key,lane in body["lanes"].items():
             info=book_report(conn,lane)
+            records[key] = info
             missing=lane["book_id"] not in saved
             severe=bool(missing or info["permanent_block"])
             unresolved=bool(info["problem"] or not info["accounting_complete"])
@@ -221,8 +231,13 @@ def paper(now,db,started,findings):
                     f"Book {'missing' if missing else info['book_status']}. {info['problem'] or 'Review paper ledger.'}",immediate=severe)
             books[key]={"state":info["book_status"],"problem":info["problem"],"permanent_block":info["permanent_block"],
                         "published":info["counts"].get("PUBLISHED",0),"accounting_complete":info["accounting_complete"]}
-        publications(conn,db,{lane["book_id"]:lane for lane in body["lanes"].values()},started,int(now.timestamp()))
-    return {"id":reg["id"],"controls":ctl,"publication_open":open_window,"books":books}
+        lanes = {lane["book_id"]:lane for lane in body["lanes"].values()}
+        scan_started = time.perf_counter()
+        publications(conn,db,lanes,started,time.time())
+        baseline = scan(conn,db,reg["id"],lanes,records,now,cfg)
+        scan_ms = round((time.perf_counter() - scan_started) * 1000, 2)
+    return {"id":reg["id"],"controls":ctl,"publication_open":open_window,"books":books,
+            "notifications":baseline,"notification_scan_ms":scan_ms}
 
 
 def learning(now,db,started,cfg,findings):
@@ -296,7 +311,7 @@ def collect(db,now,started,cfg,tasks):
         result["phase14"]=inspect("Phase 14",lambda:phase14(db,now,amendment,result["kucoin"],findings))
     else:
         result["kucoin"]=ku
-    result["phase15"]=inspect("Phase 15",lambda:paper(now,db,started,findings))
+    result["phase15"]=inspect("Phase 15",lambda:paper(now,db,started,cfg,findings))
     result["learning"]=inspect("Learning",lambda:learning(now,db,started,cfg,findings))
     web=dashboard.inspect()
     supervisor=optional(dashboard.ROOT/"dashboard-supervisor.json")

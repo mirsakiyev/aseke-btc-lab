@@ -79,8 +79,11 @@ def problem(db, book, reason, at, now, *, permanent=False):
     book["problem"], book["permanent_block"] = reason, permanent
 
 
-def expire(db, book, at, now, reason, kind="EXPIRED"):
-    event(db, book, kind, book["pending"]["id"], at, now, {"reason": reason})
+def expire(db, book, at, now, reason, kind="EXPIRED", **evidence):
+    if (kind == "EXPIRED" and book.get("last_source_received_at") and book.get("last_source_close") and
+            utc(book["last_source_close"]) > utc(book["pending"]["plan"]["eligible_from"])):
+        evidence["source_received_at"] = book["last_source_received_at"]
+    event(db, book, kind, book["pending"]["id"], at, now, {"reason": reason, **evidence})
     book["pending"], book["cursor"] = None, None
 
 
@@ -106,24 +109,30 @@ def open_at(db, book, trade, mark, at, now):
         return
     if at < utc(plan["eligible_from"]) or at <= utc(idea["published_at"]):
         raise ValueError("A modeled entry must follow actual publication")
-    if max(utc(bar["received_at"]) for bar in (trade,mark)) > (at+STEP).ceil(QUARTER)+pd.Timedelta(minutes=2):
+    receipt = max(utc(bar["received_at"]) for bar in (trade,mark))
+    if receipt > (at+STEP).ceil(QUARTER)+pd.Timedelta(minutes=2):
         problem(db, book, "Entry minute arrived outside its declared receipt allowance", at, now, permanent=True)
         return
     side = plan["direction"]
     if side*(mark["open"]-plan["stop"]) <= 0:
-        expire(db, book, at, now, "Stop invalidation at the trigger-basis open", "INVALIDATED")
+        expire(db, book, at, now, "Stop invalidation at the trigger-basis open", "INVALIDATED",
+               source_received_at=receipt.isoformat())
         return
     if side*(trade["open"]-plan["entry"]["trigger"]) < 0:
         # The whole bar can invalidate a still-unfilled idea without guessing an entry from its extremes.
         if side*((mark["low"] if side > 0 else mark["high"])-plan["stop"]) <= 0:
-            expire(db, book, at+STEP, now, "Stop invalidation before any eligible open", "INVALIDATED")
+            expire(db, book, at+STEP, now, "Stop invalidation before any eligible open", "INVALIDATED",
+                   source_received_at=receipt.isoformat())
         return
     contract = Contract.load(plan["contract"])
     cost = Cost(plan["cost"]["taker"], plan["cost"]["adverse_proxy"])
     order = Order(**plan["order"])
     contracts, price = entry_fill(order, trade["open"], side, contract, cost, 1.)
-    if not contracts or not plan["entry"]["minimum"] <= price <= plan["entry"]["maximum"]:
-        expire(db, book, at, now, "Adverse-adjusted entry outside the frozen range or capacity", "INVALIDATED")
+    within_range = plan["entry"]["minimum"] <= price <= plan["entry"]["maximum"]
+    if not contracts or not within_range:
+        expire(db, book, at, now, "Adverse-adjusted entry outside the frozen range or capacity", "INVALIDATED",
+               reason_code="INSUFFICIENT_EXECUTABLE_CAPACITY" if within_range else "ENTRY_OUTSIDE_FROZEN_RANGE",
+               source_received_at=receipt.isoformat())
         return
     quantity = contracts*contract.base_per_contract
     notional = quantity*price
@@ -139,7 +148,9 @@ def open_at(db, book, trade, mark, at, now):
               "planned_risk": order.planned_risk*contracts/order.contracts, "position": asdict(pos), "last_mark": mark["open"]}
     event(db, book, "ENTRY_OBSERVED", idea["id"], at, now, {"basis": "TRADE_MINUTE_OPEN", "trade": trade, "trigger_bar": mark})
     event(db, book, "HYPOTHETICAL_FILL", idea["id"], at, now, {"quantity": quantity, "price": price, "fee": fee,
-          "margin": margin, "planned_risk": record["planned_risk"], "entry_basis": "TRADE_MINUTE_OPEN_WITH_ADVERSE"})
+          "margin": margin, "planned_risk": record["planned_risk"], "entry_basis": "TRADE_MINUTE_OPEN_WITH_ADVERSE",
+          "contracts": contracts if contract.family == "linear_perp" else None, "stop": record["stop"], "target": target,
+          "entry_equity": record["entry_cash"], "deadline": deadline.isoformat(), "source_received_at": receipt.isoformat()})
     book["position"], book["pending"] = record, None
     book["fees"] += fee
     book["turnover"] += notional
@@ -170,7 +181,13 @@ def close_at(db, book, record, pos, action, raw, at, now, trade, mark):
     pos.reduce(units, price, cost, contract.liquidation_fee_rate if forced else 0., liquidated=forced)
     raw_gross = pos.direction*units*(raw-record["raw_entry"])
     net = pos.wallet-record["entry_cash"]
+    exit_kind = action
+    if action == "time_exit" and plan["session_flat"] and utc(record["deadline"]) == utc(plan["session_flat"]):
+        exit_kind = "session_flat"
+    elif action == "stop" and plan["trailing_atr"] and record["stop"] != plan["stop"]:
+        exit_kind = "trailing_stop"
     settled = {"reason": action, "entry_at": record["entry_at"], "exit_at": at.isoformat(), "exit_price": price, "raw_exit": raw,
+               "exit_kind": exit_kind, "entry_price": pos.entry, "equity_before": record["entry_cash"], "equity_after": pos.wallet,
                "gross_price_pnl": pos.realized, "gross_before_adverse": raw_gross, "adverse_cost_in_gross": raw_gross-pos.realized,
                "fees": pos.fees, "funding": pos.funding, "liquidation_cost": pos.liquidation_cost,
                "unfunded_deficit": pos.unfunded_deficit, "net": net, "net_r": net/record["planned_risk"],
@@ -254,9 +271,11 @@ def minute(db, book, at, now, trade, mark, funding=(), trail=None):
                 raw = (trade["low"] if side > 0 else trade["high"]) if contract.family == "linear_perp" else level
                 close_at(db, book, record, pos, action, raw, at+STEP, now, trade, mark)
             else:
-                record.update(position=asdict(pos), last_mark=mark["close"])
+                record.update(position=asdict(pos), last_mark=mark["close"], mark_source_at=mark["close_at"],
+                              mark_received_at=mark["received_at"])
                 mark_account(book, pos, mark["close"])
     book["last_source_close"] = (at+STEP).isoformat()
+    book["last_source_received_at"] = max(utc(bar["received_at"]) for bar in (trade,mark)).isoformat()
     book["cursor"] = (at+STEP).isoformat() if book["pending"] or book["position"] else None
     return True
 
