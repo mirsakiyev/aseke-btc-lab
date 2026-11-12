@@ -2,6 +2,9 @@ from collections import Counter
 from copy import copy
 from dataclasses import asdict, replace
 from functools import partial
+from base64 import b64encode
+import gzip
+from hashlib import sha256
 import json
 from math import ceil
 
@@ -10,15 +13,17 @@ import pandas as pd
 
 from lab.execution import execution_open
 from lab.learning.data import Market
-from lab.learning.features import directions
 from lab.learning.simulator import Cost, ExecutionAssumptions, run_trade as spot_trade
 from lab.phase10.evaluation import account_replay
 from lab.phase10.trading import run_trade as futures_trade
 from lab.phase12.study import EquityCurve
 from lab.phase16.evaluate import account_economics
+from lab.strategy_lab import ema_pullback
 from lab.strategy_lab.datasets import timestamp
-from lab.strategy_lab.evaluator import compile_spec, feature_frame, proposal
+from lab.strategy_lab.ema_execution import run_bracket
+from lab.strategy_lab.evaluator import compile_spec, entry_sides, feature_frame, proposal
 from lab.strategy_lab.registry import digest
+from lab.strategy_lab.specification import SOURCE_POLICY
 
 
 BASE_CASES = ("base", "double_cost", "delay", "adverse_price", "missing_data", "high_volatility")
@@ -39,6 +44,18 @@ ASSUMPTIONS = {
     "adverse_funding": "Debit the absolute published rate times two at each observed settlement for each position.",
     "funding": "Use evidenced settlements. Off-grid payments use containing mark open under the historical ordering convention.",
 }
+
+
+def assumptions_for(spec):
+    if spec["execution"].get("version") != SOURCE_POLICY:
+        return ASSUMPTIONS
+    return {
+        **ASSUMPTIONS,
+        "fills": "Source benchmark enters at the next chart open using 10% equity notional and 0.05% per-side commission. "
+                 "The native execution path still uses dated instrument terms, funding and futures mark triggers. "
+                 "Phase 15 rules-only control retains its own sizing and entry timing.",
+        "boundary": "Start flat. An open bracket at the exclusive boundary remains unresolved.",
+    }
 
 
 def stages(futures):
@@ -67,7 +84,7 @@ def proposals(features, spec, compiled, market, left, right, case, dataset_hash,
         return {}, [], 0, 0
     profile, _, recipe, *_ = compiled
     frame = restrict(features, left, right)
-    sides = directions(frame, recipe["entry"], recipe["entry_parameters"], profile["long_only"])
+    sides = entry_sides(frame, profile, recipe, spec["sides"])
     if vol_gate is not None:
         sides = sides.where(frame.realized_vol.gt(vol_gate), 0)
     eligible = sides[sides != 0]
@@ -79,17 +96,19 @@ def proposals(features, spec, compiled, market, left, right, case, dataset_hash,
         setup = signal["setup"]
         if len(examples) < 5:
             examples.append({**signal, "setup": asdict(setup) if setup else None})
-        if not setup or setup.deadline + market.step >= right:
+        if not setup or setup.submit_at >= right or (setup.deadline is not None and setup.deadline + market.step >= right):
             continue
         if case == "delay":
             submit = setup.submit_at + market.step
             cutoff = profile.get("entry_cutoff_minute_utc")
-            if submit >= setup.deadline - market.step or (cutoff is not None and submit >= at.normalize() + pd.Timedelta(minutes=cutoff)):
+            if submit >= right or (setup.deadline is not None and submit >= setup.deadline - market.step) or (
+                cutoff is not None and submit >= at.normalize() + pd.Timedelta(minutes=cutoff)
+            ):
                 continue
             # The existing executor delays scheduled exits too. Schedule the
             # time exit one bar earlier so its actual fill keeps the deadline.
-            setup = replace(setup, submit_at=submit, expires_at=setup.expires_at + market.step,
-                            deadline=setup.deadline - market.step)
+            deadline = setup.deadline - market.step if setup.deadline is not None else None
+            setup = replace(setup, submit_at=submit, expires_at=setup.expires_at + market.step, deadline=deadline)
         setups[at] = setup
     return setups, examples, int(frame.ready.sum()), len(eligible)
 
@@ -160,11 +179,30 @@ def weekly_uncertainty(trades, max_hold_minutes):
             "mean_net_r_95_interval": [float(value) for value in interval], "selection_adjusted": False}
 
 
+def ema_decision_audit(features, profile, recipe, spec, left, right, ledger, vol_gate):
+    clock = pd.date_range(left, right, freq=profile["decision"], inclusive="left")
+    names = [*ema_pullback.COMPARISONS, "atr", "swing_low", "swing_high", "realized_vol", "contiguous_bars"]
+    values = features.reindex(index=clock, columns=names)
+    checks = ema_pullback.gate_frame(features).reindex(clock)
+    path = {row["decision_at"]: f"{row['status']}/{row['reason']}" for row in ledger}
+    side = entry_sides(features, profile, recipe, spec["sides"]).reindex(clock)
+    audit = pd.concat([values, checks], axis=1)
+    audit["completed_decision"] = clock.isin(features.index)
+    audit["profile_signal"] = side
+    audit["volatility_gate"] = values.realized_vol.gt(vol_gate) if vol_gate is not None else None
+    audit["account_replay"] = [path.get(at) for at in clock]
+    nullable = audit.astype(object).where(audit.notna(), None)
+    payload = json.dumps(nullable.values.tolist(), separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {"start": left.isoformat(), "step": profile["decision"], "rows": len(clock),
+            "columns": list(audit.columns), "format": "base64+gzip+json-array", "sha256": sha256(payload).hexdigest(),
+            "data": b64encode(gzip.compress(payload, mtime=0)).decode("ascii")}
+
+
 def run_case(market, contract, spec, stage, intervals, dataset_hash, cache):
     window, case = stage.split("/")
     left, right = map(timestamp, intervals[window])
     compiled = compile_spec(spec)
-    _, rules, _, risk, cost = compiled
+    profile, rules, recipe, risk, cost = compiled
     is_futures = spec["market"] == "FUTURES"
     changed = stress_market(market, case, left, right)
     key = (digest(spec), case == "missing_data")
@@ -187,6 +225,8 @@ def run_case(market, contract, spec, stage, intervals, dataset_hash, cache):
         executor = funding_executor(changed)
     if case == "delay":
         executor = partial(executor, assumptions=ExecutionAssumptions(delay_exit_bars=1))
+    if recipe["entry"] == ema_pullback.FAMILY:
+        executor = partial(run_bracket, executor)
     allowance = pd.Timedelta(seconds=rules["processing_seconds"])
     trail = {} if features.empty else {
         execution_open(at + allowance, changed.step): (row.close, row.atr)
@@ -219,14 +259,14 @@ def run_case(market, contract, spec, stage, intervals, dataset_hash, cache):
         profit_factor=gross_profit / gross_loss if gross_loss else None, cash_reference_return=0.,
         **ratios(equity, complete),
     )
-    if complete and metrics["uncertainty"]["status"] == "INSUFFICIENT_EVIDENCE":
+    if complete and profile["max_hold_minutes"] is not None and metrics["uncertainty"]["status"] == "INSUFFICIENT_EVIDENCE":
         metrics["uncertainty"] = weekly_uncertainty(completed, spec["session"]["max_hold_minutes"])
     if not complete:
         for key in ("return", "net_expectancy", "mean_net_r", "win_rate", "profit_factor", "sharpe", "sortino"):
             metrics[key] = None
         metrics.update(completed_folds={}, worst_completed_fold_return=None)
     points = np.unique(np.linspace(0, len(equity) - 1, min(241, len(equity)), dtype=int))
-    return {"case": case, "window": window, "start": left.isoformat(), "end_exclusive": right.isoformat(),
+    result = {"case": case, "window": window, "start": left.isoformat(), "end_exclusive": right.isoformat(),
             "status": "DESCRIPTIVE" if complete and len(completed) >= MIN_TRADES else "INCONCLUSIVE",
             "metrics": metrics, "coverage": {"trade": trade_rows, "mark": mark_rows, "expected": expected,
                 "feature_ready_decisions": ready, "expected_decisions": expected_ready},
@@ -235,3 +275,6 @@ def run_case(market, contract, spec, stage, intervals, dataset_hash, cache):
             "execution_reasons": dict(Counter(row["reason"] for row in ledger)),
             "ledger_hash": digest(json.loads(json.dumps(ledger, default=str, allow_nan=False))),
             "equity": [[equity.index[i].isoformat(), float(equity.iloc[i])] for i in points]}
+    if recipe["entry"] == ema_pullback.FAMILY:
+        result["decision_audit"] = ema_decision_audit(features, profile, recipe, spec, left, right, ledger, vol_gate)
+    return result

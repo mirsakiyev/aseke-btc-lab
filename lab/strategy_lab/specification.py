@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from lab.learning.features import REGISTRY
+from lab.strategy_lab.ema_pullback import ENTRY_PARAMETERS as EMA_ENTRY, EXIT_PARAMETERS as EMA_EXIT, EXIT as EMA_BRACKET, FAMILY as EMA_FAMILY
 from lab.strategy_lab.registry import PROFILES, SOURCE_TYPES, identifier, register
 
 
@@ -11,14 +12,17 @@ MAX_SOURCE_BYTES = 2 * 1024**2
 MAX_SOURCE_STORAGE = 64 * 1024**2
 MAX_SPEC_BYTES = 64 * 1024
 POLICY = "closed-input-ioc-onebar-v1"
+SOURCE_POLICY = "pine-next-chart-open-v1"
 ENTRIES = {
     "breakout_v1": ("prior_range", "Completed close strictly beyond the previous 20 decision bars, in the direction of every completed context SMA regime."),
     "pullback_v1": ("prior_retracement_atr", "All context trends agree, the prior close retraced by the configured ATR distance beyond its EMA26, and the current close reverses in the trend direction."),
     "range_reversion_v1": ("deviation_atr", "Context distance is within the configured absolute maximum. Close deviates beyond EMA26 by the configured ATR multiple and RSI14 is below 0.4 for long or above 0.6 for short."),
+    EMA_FAMILY: ("ema_fast", "Same-chart EMA trend and prior fast-EMA touch followed by a confirmed close, volume and RSI gates."),
 }
 EXITS = {
     "fixed_r_v1": ("target_r", "Take profit at the configured multiple of distance between fill and initial stop."),
     "atr_trail_v1": ("trailing_atr", "Ratchet the stop by the configured ATR multiple behind completed decision closes."),
+    EMA_BRACKET: ("target_atr", "Freeze both bracket prices from the confirmation candle."),
 }
 INDICATORS = {
     **REGISTRY, "atr": "14-bar arithmetic mean of true range.",
@@ -29,6 +33,14 @@ INDICATORS = {
     "pivots": "2-left/2-right confirmed pivots, first usable two completed bars later.",
     "bollinger": "20-bar close SMA with bands at two population standard deviations.",
     "candle_vwap": "UTC-day cumulative typical price weighted by closed native candle volume. Candle proxy.",
+}
+EMA_INDICATORS = {
+    "ema_fast": {"length": EMA_ENTRY["ema_fast"], "definition": "Same-chart close EMA, first valid close seed"},
+    "ema_slow": {"length": EMA_ENTRY["ema_slow"], "definition": "Same-chart close EMA, first valid close seed"},
+    "rsi": {"length": EMA_ENTRY["rsi_length"], "definition": "Wilder-smoothed close gains/losses on the Pine 0–100 scale"},
+    "atr": {"length": EMA_ENTRY["atr_length"], "definition": "Wilder-smoothed true range, first bar high minus low"},
+    "volume_sma": {"length": EMA_ENTRY["volume_length"], "definition": "Same-chart volume SMA including the confirmation bar"},
+    "swing_extremes": {"length": EMA_EXIT["swing_bars"], "definition": "Rolling low/high including the confirmation bar"},
 }
 DEPENDENCIES = {"trade_ohlcv", "mark_ohlc", "settled_funding", "dated_contract"}
 DISCRETION = re.compile(r"\b(?:looks? strong|use judgment|discretionary|as needed|clean breakout|tbd|somewhat|eyeball)\b", re.I)
@@ -121,7 +133,13 @@ def validate(spec):
         if not isinstance(spec.get(field), dict) or not spec[field]:
             flag(field, "Specify the policy and its parameters")
     session = spec.get("session")
-    if not isinstance(session, dict) or session.get("timezone") != "UTC" or (
+    execution = spec.get("execution")
+    source_benchmark = (spec.get("family_id") == EMA_FAMILY and isinstance(execution, dict)
+                        and execution.get("version") == SOURCE_POLICY)
+    if source_benchmark:
+        if session != {"timezone": "UTC", "max_hold_minutes": None}:
+            flag("session", "The source benchmark has no session or time stop")
+    elif not isinstance(session, dict) or session.get("timezone") != "UTC" or (
         type(session.get("max_hold_minutes")) is not int or session["max_hold_minutes"] < 1
     ):
         flag("session", "Specify UTC and a positive maximum hold in minutes")
@@ -188,3 +206,21 @@ def recipe_description(entry, exit_name, params):
         [EXITS[exit_name][1], "Close on protective stop, applicable liquidation, or the frozen time/session deadline."],
         [f"Initial stop is {params['initial_atr']:g} × ATR from the decision close, replaced by a closer confirmed pivot only if it is at least one ATR away."],
     )
+
+
+def ema_rule_description(sides):
+    entry = [
+        "A completed and available confirmation candle is required. The account must be flat.",
+        "Long requires EMA50 > EMA200, prior low <= prior EMA50 or prior close < prior EMA50, and current close > EMA50.",
+        "Long volume must be strictly above the current 20-bar volume SMA and RSI(14) strictly above 40.",
+    ]
+    exits = ["Freeze the long target at confirmation close plus 2.5 × ATR(14)."]
+    stops = ["Freeze the long stop at the five-bar lowest low, including confirmation, minus 0.5 × ATR(14)."]
+    if "short" in sides:
+        entry += [
+            "Short requires EMA50 < EMA200, prior high >= prior EMA50 or prior close > prior EMA50, and current close < EMA50.",
+            "Short volume must be strictly above the current 20-bar volume SMA and RSI(14) strictly below 60.",
+        ]
+        exits.append("Freeze the short target at confirmation close minus 2.5 × ATR(14).")
+        stops.append("Freeze the short stop at the five-bar highest high, including confirmation, plus 0.5 × ATR(14).")
+    return entry, exits, stops

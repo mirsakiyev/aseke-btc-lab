@@ -18,7 +18,8 @@ from lab.storage import utc_now, writer_lock
 from lab.strategy_lab.datasets import bounds, data_id, load_market, timestamp
 from lab.strategy_lab.evaluator import code_hash, compile_spec, tested
 from lab.strategy_lab.registry import ROOT, canonical, connect, digest, event, get, now
-from lab.strategy_lab.replay import ASSUMPTIONS, BASE_CASES, FUTURES_CASES, run_case, stages
+from lab.strategy_lab.replay import BASE_CASES, FUTURES_CASES, assumptions_for, run_case, stages
+from lab.strategy_lab.specification import SOURCE_POLICY
 
 
 MIB = 1024**2
@@ -77,7 +78,7 @@ def request_job(db, version, dataset, development, validation, approved_by):
                  "validation": [val_start.isoformat(), val_end.isoformat()]}
     identity = {"version": version, "dataset": dataset, "intervals": intervals, "baseline": baseline["hash"],
                 "baseline_recipe": digest(baseline_spec),
-                "code": code, "runtime": runtime(), "budget": BUDGET, "assumptions": ASSUMPTIONS}
+                "code": code, "runtime": runtime(), "budget": BUDGET, "assumptions": assumptions_for(spec)}
     key = digest(identity)
     if db.execute("SELECT 1 FROM job WHERE hash=?", (key,)).fetchone():
         return status(db, key)
@@ -94,6 +95,8 @@ def request_job(db, version, dataset, development, validation, approved_by):
 
 def baseline_for(db, baseline, spec):
     reference = get(db, baseline)["spec"]
+    if spec["execution"].get("version") == SOURCE_POLICY:
+        return {**reference, "cost": spec["cost"]}
     return {**reference, "cost": spec["cost"], "risk": spec["risk"],
             "session": spec["session"], "execution": spec["execution"]}
 
@@ -226,7 +229,7 @@ def work(root, key, parent):
         with connect(root, write=True) as db:
             if status(db, key)["state"] == "RUNNING":
                 cases = records(db, key)
-                finding = verdict(cases, coverage, body)
+                finding = verdict(cases, coverage, body, source_benchmark=spec["execution"].get("version") == SOURCE_POLICY)
                 checkpoint(db, key, "verdict", finding)
                 strategy = get(db, request["version"])
                 complete = cases["validation/base"]["metrics"]["accounting_complete"]
@@ -237,7 +240,11 @@ def work(root, key, parent):
                 update(db, key, "COMPLETE", "Historical report assembled")
 
 
-def verdict(cases, coverage, body):
+def verdict(cases, coverage, body, *, source_benchmark=False):
+    if source_benchmark:
+        return {"status": "INCONCLUSIVE", "data": coverage, "sample_floor": 25, "selection_adjusted": False,
+                "evidence": "HISTORICAL_DEVELOPMENT_ONLY",
+                "reason": "Source-reference diagnostic. The control uses different sizing and timing, so no matched screen applies."}
     base = cases["validation/base"]
     peer = cases["validation/baseline"]
     stress = [case for case in BASE_CASES + FUTURES_CASES if case not in ("base", "missing_data")

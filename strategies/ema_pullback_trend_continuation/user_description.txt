@@ -1,0 +1,32 @@
+The strategy attempts to enter during trend continuation
+after a retracement toward the 50 EMA, rather than entering
+on a range breakout.
+
+The 50 EMA serves as the pullback reference level.
+The 200 EMA provides a broader trend filter.
+
+After a previous candle touches/crosses the fast EMA,
+a completed confirmation candle must close back on
+the appropriate side of it.
+
+The confirmation candle must have above-average volume
+and sufficient RSI momentum.
+
+The trade uses a structural stop at the rolling five-bar
+extreme, with a 0.5 ATR buffer, and a target 2.5 ATR
+away from the confirmation candle close.
+
+The author's narrative suggests the strategy may
+perform better in trending markets than ranging markets.
+This is a hypothesis, not an established performance fact.
+
+Suggested research profiles:
+- Swing: KuCoin XBTUSDTM, 4-hour candles
+- Position: KuCoin BTC-USDT Spot, daily candles
+- Day: possible later 15-minute diagnostic candidate
+
+Prioritize Swing and Position initially.
+
+Use the same indicator periods in native candles for
+each timeframe. Do not silently reinterpret 50 EMA
+as a different number of bars.

@@ -54,7 +54,8 @@ def library(db, strategies, jobs):
     selected = st.selectbox("Version", list(numbers), format_func=lambda key: f"v{numbers[key]} · {key[:12]}", key=f"version/{strategy}")
     record = get(db, selected)
     spec = record["spec"]
-    st.caption(f"{record['state']} · {record['family_id']} · {record['created_at']}")
+    version = spec.get("implementation_version") or record["created_at"]
+    st.caption(f"{record['state']} · {record['family_id']} · {version}")
     st.code(selected, language=None)
     st.write(spec.get("description"))
     for field, label in (("entry_rules", "Entry"), ("exit_rules", "Exit"), ("invalidation_rules", "Invalidation"),
@@ -65,19 +66,34 @@ def library(db, strategies, jobs):
             for item in rules:
                 st.write(item)
     latest = next((row for row in jobs if row["version"] == selected and row["state"] == "COMPLETE"), None)
+    readiness = spec.get("historical_readiness")
+    if isinstance(readiness, dict) and readiness.get("at_registration"):
+        st.caption(f"Historical readiness at registration · {readiness['at_registration']}")
+        if readiness.get("required"):
+            st.write(readiness["required"])
     if latest:
         verdict = db.execute("SELECT body FROM checkpoint WHERE job_hash=? AND stage='verdict'", (latest["hash"],)).fetchone()
         st.caption(f"Latest historical screen · {json.loads(verdict[0])['status']} · {latest['hash'][:12]}")
     with st.expander("Frozen specification and provenance"):
         st.json(spec, expanded=False)
         source = spec.get("source", {})
-        if source.get("sha256") and source.get("filename"):
-            try:
-                content = source_content(db, source["sha256"])
-                st.download_button("Download reference attachment", content, file_name=source["filename"],
-                                   mime="application/octet-stream")
-            except ValueError:
-                st.caption("Referenced attachment is unavailable in this registry")
+        for label, sha_field, filename_field in (("Download reference attachment", "sha256", "filename"),
+                                                  ("Download supplied description", "description_sha256", "description_filename")):
+            if source.get(sha_field) and source.get(filename_field):
+                try:
+                    content = source_content(db, source[sha_field])
+                    st.download_button(label, content, file_name=source[filename_field],
+                                       mime="application/octet-stream", key=f"{selected}/{sha_field}")
+                except ValueError:
+                    st.caption("Referenced attachment is unavailable in this registry")
+    if differences := spec.get("source_differences"):
+        with st.expander("Source and description differences"):
+            st.json(differences, expanded=True)
+    extensions = spec.get("potential_v2")
+    if isinstance(extensions, list) and extensions:
+        with st.expander("Potential research extensions"):
+            for item in extensions:
+                st.write(item)
     with st.expander("Lifecycle, test and evaluation references"):
         st.json(record["history"], expanded=False)
 

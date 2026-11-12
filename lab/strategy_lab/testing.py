@@ -1,13 +1,17 @@
 """Small, deterministic signal contract shared by operator and automated tests."""
 import pandas as pd
 
+from lab.strategy_lab import ema_pullback
 from lab.strategy_lab.evaluator import proposal
+from lab.strategy_lab.specification import SOURCE_POLICY
 
 
 def signal_contract(spec, profile):
     # Tuesday midnight satisfies Day's entry cutoff and all profile grids.
     at = pd.Timestamp("2024-04-02T00:00:00Z")
     entry = spec["recipe"]["entry"]
+    if entry == ema_pullback.FAMILY:
+        return ema_signal_contract(spec, at)
     sign = 1 if "long" in spec["sides"] else -1
     params = spec["recipe"]["entry_parameters"]
     distance = params.get("deviation_atr", 1) + 1
@@ -29,3 +33,28 @@ def signal_contract(spec, profile):
         frame.index = [blocked]
         assert proposal(frame, blocked, spec, data_hash="controlled-fixture")["gates"]["session"] is False
     return ["determinism", "supported direction", "causal submit", "warmup", "missing decision", "applicable session"]
+
+
+def ema_signal_contract(spec, at):
+    sides = [sign for label, sign in (("long", 1), ("short", -1)) if label in spec["sides"]]
+    for side in sides:
+        row = {"ready": True, "close": 100., "ema_fast": 100. - side, "ema_slow": 100. - 2 * side,
+               "prior_ema_fast": 100., "prior_close": 100., "prior_low": 99., "prior_high": 101.,
+               "volume": 2., "volume_sma": 1., "rsi": 50., "atr": 2., "swing_low": 97., "swing_high": 103.}
+        frame = pd.DataFrame([row], index=[at])
+        good = proposal(frame, at, spec, data_hash="controlled-ema-fixture")
+        assert good == proposal(frame, at, spec, data_hash="controlled-ema-fixture")
+        assert good["decision"] == "PROPOSAL"
+        setup = good["setup"]
+        assert setup.direction == side and setup.stop == 100. - 4 * side and setup.target_price == 100. + 5 * side
+        if spec["execution"]["version"] == SOURCE_POLICY:
+            assert setup.submit_at == at and setup.deadline is None
+        else:
+            assert setup.submit_at > setup.available_at and setup.deadline > setup.submit_at
+        occupied = proposal(frame, at, spec, data_hash="controlled-ema-fixture", position_open=True)
+        assert occupied["decision"] == "NO_TRADE" and occupied["gates"]["account_flat"] is False
+        for rejected in (frame.assign(ready=False), frame.assign(volume=1.),
+                         frame.assign(rsi=40. if side == 1 else 60.), frame.iloc[:0]):
+            assert proposal(rejected, at, spec, data_hash="controlled-ema-fixture")["decision"] == "NO_TRADE"
+    return ["determinism", "profile sides", "strict volume and RSI", "signal-priced bracket", "entry timing",
+            "flat-position gate", "warmup", "missing decision"]

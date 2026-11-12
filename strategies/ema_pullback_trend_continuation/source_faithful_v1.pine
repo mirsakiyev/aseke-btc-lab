@@ -1,0 +1,92 @@
+//@version=6
+strategy("EMA Pullback Trend Continuation", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.05)
+
+// INPUTS
+emaFast = input.int(50, "Fast EMA (Pullback Level)", group="EMAs")
+emaSlow = input.int(200, "Slow EMA (Trend Filter)", group="EMAs")
+rsiLen = input.int(14, "RSI Length", group="Momentum")
+rsiBull = input.int(40, "RSI Min for Longs", group="Momentum")
+rsiBear = input.int(60, "RSI Max for Shorts", group="Momentum")
+volLen = input.int(20, "Volume MA Length", group="Volume")
+atrLen = input.int(14, "ATR Length", group="Risk")
+tpMult = input.float(2.5, "TP ATR Multiplier", group="Risk", step=0.1)
+slBuf = input.float(0.5, "SL ATR Buffer", group="Risk", step=0.1)
+
+// INDICATORS
+emaF = ta.ema(close, emaFast)
+emaS = ta.ema(close, emaSlow)
+rsiVal = ta.rsi(close, rsiLen)
+atrVal = ta.atr(atrLen)
+volAbove = volume > ta.sma(volume, volLen)
+
+// TREND REGIME
+bullRegime = emaF > emaS
+bearRegime = emaF < emaS
+
+// PULLBACK DETECTION
+touchedEmaFromAbove = low[1] <= emaF[1] or close[1] < emaF[1]
+touchedEmaFromBelow = high[1] >= emaF[1] or close[1] > emaF[1]
+
+// CONFIRMATION
+bullConfirm = close > emaF and touchedEmaFromAbove
+bearConfirm = close < emaF and touchedEmaFromBelow
+
+// SWING LOW/HIGH FOR STOPS
+swingLow = ta.lowest(low, 5)
+swingHigh = ta.highest(high, 5)
+
+// ENTRY CONDITIONS
+longCond = bullRegime and bullConfirm and volAbove and rsiVal > rsiBull and barstate.isconfirmed and strategy.position_size == 0
+shortCond = bearRegime and bearConfirm and volAbove and rsiVal < rsiBear and barstate.isconfirmed and strategy.position_size == 0
+
+// EXECUTION
+longSL = swingLow - atrVal * slBuf
+longTP = close + atrVal * tpMult
+shortSL = swingHigh + atrVal * slBuf
+shortTP = close - atrVal * tpMult
+
+if longCond
+    strategy.entry("Long", strategy.long,
+         alert_message="EMA pullback long confirmed — {{ticker}} @ {{close}}")
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+
+if shortCond
+    strategy.entry("Short", strategy.short,
+         alert_message="EMA pullback short confirmed — {{ticker}} @ {{close}}")
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+// P&L LABELS
+var int lastCount = 0
+
+if strategy.closedtrades > lastCount
+    lastCount := strategy.closedtrades
+    pnl = strategy.closedtrades.profit(lastCount - 1)
+    isLong = strategy.closedtrades.size(lastCount - 1) > 0
+    isWin = pnl > 0
+    labelColor = isWin ? color.new(color.green, 20) : color.new(color.red, 20)
+    labelStyle = isLong ? label.style_label_up : label.style_label_down
+    arrow = isWin ? "✔ +" : "✘ "
+    label.new(
+         x=bar_index,
+         y=isLong ? low - atrVal * 0.8 : high + atrVal * 0.8,
+         text=arrow + str.tostring(math.round(pnl, 2)),
+         color=labelColor,
+         textcolor=color.white,
+         style=labelStyle,
+         size=size.small)
+
+// VISUALS
+plot(emaF, "Fast EMA (50)", color=color.orange, linewidth=2)
+plot(emaS, "Slow EMA (200)", color=color.new(color.blue, 30), linewidth=1)
+
+plotshape(longCond, location=location.belowbar,
+     color=color.green, style=shape.triangleup,
+     size=size.normal, text="PB↑")
+
+plotshape(shortCond, location=location.abovebar,
+     color=color.red, style=shape.triangledown,
+     size=size.normal, text="PB↓")
+
+bgcolor(bullRegime ? color.new(color.green, 97) : color.new(color.red, 97))

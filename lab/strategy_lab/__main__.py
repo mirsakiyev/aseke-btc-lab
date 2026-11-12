@@ -6,10 +6,10 @@ import sys
 from lab.storage import put_bytes, write_json
 from lab.strategy_lab import comparison, jobs, prospective
 from lab.strategy_lab.datasets import admit, data_id
-from lab.strategy_lab.evaluator import evaluate, test_version
+from lab.strategy_lab.evaluator import code_hash, evaluate, test_version, tested
 from lab.strategy_lab.registry import PROFILES, ROOT, STATES, connect, get, inventory, source_content, transition
 from lab.strategy_lab.seed import seed
-from lab.strategy_lab.specification import ENTRIES, EXITS, INDICATORS, stage, template, validate
+from lab.strategy_lab.specification import EMA_BRACKET, EMA_ENTRY, EMA_EXIT, EMA_FAMILY, EMA_INDICATORS, ENTRIES, EXITS, INDICATORS, stage, template, validate
 
 
 def read_object(path, limit=4 * 1024**2):
@@ -26,7 +26,7 @@ def read_object(path, limit=4 * 1024**2):
 def parser():
     cli = argparse.ArgumentParser(prog="strategy-lab")
     commands = cli.add_subparsers(dest="command", required=True)
-    for action in ("seed", "list", "recipes", "datasets", "jobs", "run-next", "proposals"):
+    for action in ("seed", "import-ema-pullback", "list", "recipes", "datasets", "jobs", "run-next", "proposals"):
         commands.add_parser(action)
     commands.add_parser("template").add_argument("profile", choices=PROFILES)
     commands.add_parser("validate").add_argument("file", type=Path)
@@ -62,6 +62,7 @@ def parser():
     signal.add_argument("dataset")
     signal.add_argument("decision")
     signal.add_argument("--as-of", required=True)
+    signal.add_argument("--position-open", action="store_true", help="Evaluate the entry gate with an existing position")
     for action in ("preview-proposal", "propose"):
         command = commands.add_parser(action)
         command.add_argument("version")
@@ -90,7 +91,9 @@ def execute(args):
     if command == "template":
         return template(args.profile)
     if command == "recipes":
-        return {"entries": ENTRIES, "exits": EXITS, "indicators": INDICATORS}
+        return {"entries": ENTRIES, "exits": EXITS, "indicators": INDICATORS,
+                "ema_pullback": {"entry": EMA_FAMILY, "exit": EMA_BRACKET, "entry_defaults": EMA_ENTRY,
+                                 "exit_defaults": EMA_EXIT, "indicators": EMA_INDICATORS}}
     if command == "validate":
         issues = validate(read_object(args.file))
         return {"status": "NEEDS_CLARIFICATION" if issues else "SPECIFIED", "issues": issues}
@@ -104,11 +107,20 @@ def execute(args):
                 raise SystemExit(2) from exc
             raise
         return {"worker": "FINISHED"}
-    writes = {"seed", "stage", "state", "test", "admit-data", "request", "cancel", "resume", "propose", "review-proposal"}
+    writes = {"seed", "import-ema-pullback", "stage", "state", "test", "admit-data", "request", "cancel", "resume",
+              "propose", "review-proposal"}
     with connect(write=command in writes) as db:
         if command == "seed":
             result = seed(db)
             return {**result, "versions": [summary(record) for record in result["versions"]]}
+        if command == "import-ema-pullback":
+            from lab.strategy_lab.ema_registration import register_ema_pullback
+
+            code = code_hash()
+            versions = [record if tested(record, code) else test_version(db, record["hash"])
+                        for record in register_ema_pullback(db)]
+            return {"versions": [summary(record) for record in versions], "historical_readiness": "BLOCKED_DATA",
+                    "evaluator_code": code}
         if command == "list":
             return [summary(record) for record in inventory(db)]
         if command == "show":
@@ -155,7 +167,8 @@ def execute(args):
             if any(spec[key] != body[key] for key in ("profile", "venue", "market", "instrument")):
                 raise ValueError("Dataset does not match the frozen strategy")
             market, _, _ = load_market(ROOT, body)
-            return evaluate(market.trade, spec, args.decision, as_of=args.as_of, data_hash=args.dataset)
+            return evaluate(market.trade, spec, args.decision, as_of=args.as_of, data_hash=args.dataset,
+                            position_open=args.position_open)
         if command == "preview-proposal":
             return prospective.preview(db, args.version, args.job)
         if command == "propose":
