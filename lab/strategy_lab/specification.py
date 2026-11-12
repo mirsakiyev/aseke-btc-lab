@@ -145,7 +145,10 @@ def validate(spec):
         flag("session", "Specify UTC and a positive maximum hold in minutes")
     else:
         cutoff, flat = session.get("entry_cutoff_minute_utc"), session.get("flat_minute_utc")
-        if (profile == "day" or cutoff is not None or flat is not None) and (
+        ema_day_24h = (spec.get("strategy_id") == f"{EMA_FAMILY}/day"
+                       and spec.get("implementation_version") == "aseke_day_v1"
+                       and session == {"timezone": "UTC", "max_hold_minutes": 480})
+        if ((profile == "day" and not ema_day_24h) or cutoff is not None or flat is not None) and (
             type(cutoff) is not int or type(flat) is not int or not 0 < cutoff < flat < 1440
         ):
             flag("session", "Supply a valid entry cutoff strictly before the UTC flat time")

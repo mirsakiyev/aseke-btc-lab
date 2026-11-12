@@ -46,9 +46,14 @@ def compile_spec(spec):
         raise ValueError("Use the built-in entry family ID for its profile, parameter and exit variants")
     ep, xp = recipe["entry_parameters"], recipe["exit_parameters"]
     if is_ema:
+        ema_day = (spec["profile"] == "day" and spec["strategy_id"] == f"{ema_pullback.FAMILY}/day"
+                   and spec["implementation_version"] == "aseke_day_v1"
+                   and spec["session"] == {"timezone": "UTC", "max_hold_minutes": 480}
+                   and spec["sides"] == ["long", "short"])
         if (exit_name != ema_pullback.EXIT or ep != ema_pullback.ENTRY_PARAMETERS or xp != ema_pullback.EXIT_PARAMETERS
-                or spec["profile"] not in ("position", "swing") or spec["indicators"] != EMA_INDICATORS or spec["context"]):
-            raise ValueError("EMA v1 requires the frozen same-chart indicators, bracket defaults and a Position or Swing profile")
+                or (spec["profile"] not in ("position", "swing") and not ema_day)
+                or spec["indicators"] != EMA_INDICATORS or spec["context"]):
+            raise ValueError("EMA v1 requires the frozen same-chart indicators, bracket defaults and a reviewed profile")
         if spec.get("evaluator", {}).get("code_sha256") != ema_code_hashes():
             raise ValueError("EMA v1 evaluator code differs from its frozen version")
     else:

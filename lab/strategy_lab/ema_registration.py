@@ -78,7 +78,7 @@ def _profile_baseline(db, profile):
 
 
 def _spec(db, variant, source, code):
-    profile = "position" if variant == "position" else "swing"
+    profile = "swing" if variant == "source" else variant
     spec = template(profile)
     entry, exit_rules, invalidation = ema_rule_description(spec["sides"])
     role = "SOURCE_ALLOCATION_BENCHMARK" if variant == "source" else "ASEKE_PROFILE_RESEARCH"
@@ -128,6 +128,11 @@ def _spec(db, variant, source, code):
         spec["limitations"].append("The profile applies its own costs, bounded native IOC entry and maximum hold.")
         if profile == "position":
             spec["limitations"].append("The Spot variant suppresses short proposals.")
+        elif profile == "day":
+            spec["session"] = {"timezone": "UTC", "max_hold_minutes": 480}
+            spec["variant"]["role"] = "ASEKE_PROSPECTIVE_PAPER"
+            spec["profile_compatibility"]["day"] = "XBTUSDTM futures on 15m decisions, both sides, 24/7 UTC."
+            spec["limitations"].append("The Day variant has a 480-minute hold cap across midnight and no daily session cutoff.")
     return spec
 
 
@@ -154,3 +159,22 @@ def register_ema_pullback(db):
             )
         records.append(record)
     return records
+
+
+def register_ema_day(db):
+    source = _stage_artifacts(db)
+    code = ema_code_hashes()
+    spec = _spec(db, "day", source, code)
+    prior = db.execute("SELECT hash FROM strategy_version WHERE strategy_id=? AND version=1",
+                       (spec["strategy_id"],)).fetchone()
+    if prior:
+        record = get(db, prior["hash"])
+        if record["spec"] != spec:
+            raise ValueError("Frozen EMA Day v1 differs. A reviewed new version is required")
+        return record
+    if issues := validate(spec):
+        raise ValueError(f"EMA Day specification requires review: {issues}")
+    return register(db, spec, initial="SPECIFIED", reason="Reviewed 24/7 Day version for authorized prospective paper",
+                    flags={"evidence_quality": "REVIEWED_SOURCE", "data_completeness": "BLOCKED_DATA"},
+                    reference={"pine_sha256": source["sha256"], "description_sha256": source["description_sha256"],
+                               "evaluator_code_sha256": code})

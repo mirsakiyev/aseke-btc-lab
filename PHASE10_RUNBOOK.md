@@ -24,7 +24,7 @@ Run commands from the project root. The status view separates enabled controls, 
 After the local checks, run the following in an **interactive administrator Windows PowerShell** under the account that owns the project. The separate task uses the Windows-native password prompt. The credential is stored by Windows Task Scheduler.
 
 ```powershell
-Set-Location -LiteralPath 'C:\Users\16477\Projects\aseke-btc-lab'
+# Run from the repository root.
 .\phase10.ps1 install -Register
 .\phase10.ps1 start
 .\phase10.ps1 verify

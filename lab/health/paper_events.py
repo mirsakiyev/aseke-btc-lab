@@ -185,7 +185,8 @@ def queue_idea(paper, db, lane, book, idea_id, floor):
 
 def open_updates(db, lanes, books, now, cfg):
     active = {info["position"]["id"] for info in books.values() if info["position"]}
-    for row in db.execute("SELECT id,idea_id FROM outbox WHERE category='open_position' AND status IN ('PENDING','RETRY')"):
+    for row in db.execute("SELECT id,idea_id FROM outbox WHERE category='open_position' AND status IN ('PENDING','RETRY') "
+                          "AND id NOT LIKE 'ema-paper-update:%'"):
         if not cfg["categories"]["open_position"] or row["idea_id"] not in active:
             db.execute("UPDATE outbox SET status='SUPERSEDED' WHERE id=?", (row["id"],))
     if not cfg["categories"]["open_position"]:

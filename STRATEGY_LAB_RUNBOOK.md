@@ -94,6 +94,8 @@ Spot and futures use separate existing executors, with a common rules-only basel
 
 ## Prospective review
 
+The operator-authorized EMA paper cohort has its own forward-only registration and data grant workflow. Its accounts and lifecycle events are outside this historical sandbox. [EMA paper runbook](EMA_PAPER_RUNBOOK.md)
+
 After reviewing a qualifying screen, explicitly record `HISTORICAL_RESEARCH` and `SHORTLISTED` with reasons. **Prospective Experiment Proposal** previews the frozen version and checks eligibility. Supply a future UTC-aligned start, horizon, minimum closed trades, execution model, and a data-availability contract with source, receipt rule, gap policy and economic path. The manifest records a standalone hypothetical account and comparison benchmark. Operator review can record `REVIEWED`, `CHANGES_REQUESTED`, or `DECLINED`. The manifest remains **DISABLED / AWAITING_EXPLICIT_APPROVAL**.
 
 ```powershell

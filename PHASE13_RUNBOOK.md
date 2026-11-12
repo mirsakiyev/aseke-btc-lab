@@ -54,7 +54,7 @@ Public API references are [KuCoin candles](https://www.kucoin.com/docs-new/v2/re
 The existing KuCoin task already owns a healthy worker. The first Phase 13 observation ran on demand. To load the extension, use the existing scheduler controls in the administrator Windows PowerShell already available to the operator:
 
 ```powershell
-Set-Location -LiteralPath 'C:\Users\16477\Projects\aseke-btc-lab'
+# Run from the repository root.
 .\phase10.ps1 stop
 .\phase10.ps1 start
 .\phase10.ps1 verify

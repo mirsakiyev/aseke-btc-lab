@@ -7,7 +7,7 @@ The watchdog reads existing local collector, scheduler, research and paper-accou
 From an administrator PowerShell signed in as the existing lab Windows account:
 
 ```powershell
-Set-Location -LiteralPath 'C:\Users\16477\Projects\aseke-btc-lab'
+# Run from the repository root.
 .\health.ps1 install
 .\health.ps1 task-status
 .\health.ps1 dashboard-status
@@ -53,14 +53,16 @@ After installation, `.\health.ps1 start` starts the two registered tasks. `.\hea
 .\health.ps1 category open_position off
 .\health.ps1 position-interval day 30
 .\health.ps1 category training_completion off
-.\health.ps1 audit 2026-11-10T02:00:00Z
+.\health.ps1 audit $boundaryUtc
 ```
 
 Health, published ideas, paper entry, terminal unfilled ideas and paper exits are on by default. Training completion and open-position updates are opt-in. The initial update intervals are 30 minutes for Day, 60 for Swing and 240 for Position. Mute pauses automatic delivery while checks, incident tracking and the queue continue. An explicit test can run during mute and respects Telegram rate limits. The Streamlit **Operational health** view refreshes the latest check and alert history every 30 seconds. `runs/health/last.json` is the atomic check receipt and `runs/health/watchdog.sqlite3` holds durable incident, publication and lifecycle identities. Keep both during upgrades.
 
 The installed watchdog loads updated Python source on its next scheduled run. Check `phase15.notifications` in that receipt to verify the lifecycle cursor. `check-once --no-send` still records local monitoring and queues eligible events. Use an isolated ledger and outbox for historical notification tests.
 
-The notifier reuses the existing Codex user's DPAPI credentials and destination. The watchdog can send while Codex is closed. Keep the credential file restricted to the existing Windows account, SYSTEM and Administrators. The token is used only to call the official HTTPS Bot API. [Telegram Bot API](https://core.telegram.org/bots/api)
+After the three EMA paper books are registered, scheduled checks also record `ema_paper` and `ema_paper_notifications`. EMA reads its independently authorized receipt handoff and queues only committed prospective lifecycle events under separate identities. [EMA paper runbook](EMA_PAPER_RUNBOOK.md)
+
+The notifier reuses the existing DPAPI credentials and authorized destination. The watchdog can send while Codex is closed. Keep the credential file restricted to the Windows account running the watchdog, SYSTEM and Administrators. The token is used only to call the official HTTPS Bot API. [Telegram Bot API](https://core.telegram.org/bots/api)
 
 Each check attempts at most five messages. Definite connection and Telegram rejections retry with exponential backoff and honor Telegram's requested delay, up to six attempts by default. The watchdog saves the in-flight attempt before sending. If it loses the response or crashes after Telegram may have accepted the request, the next check marks that attempt `UNCERTAIN` and leaves it for review. Telegram and the local SQLite outbox have no shared exactly-once transaction. This workstation cannot notify while powered off, offline, or unable to run the watchdog. An independent off-host heartbeat service would be needed to detect a full host outage.
 
@@ -71,18 +73,18 @@ Use `.phase15.ps1 status` for the current books and their recent saved events. U
 ```powershell
 .phase15.ps1 status
 .health.ps1 alerts
-.health.ps1 alerts --idea c3c5c7cd01b71c30ec348ae12fefd3ddee04ff7818e92c3f64715806967dc3d8
+.\health.ps1 alerts --idea $ideaId
 ```
 
 | Category | Authoritative source | Example |
 | --- | --- | --- |
 | `ideas` | Committed `PUBLISHED` | **EXPERIMENTAL IDEA** · Day SHORT · frozen entry range, stop, illustrative 2R target and entry expiry |
-| `paper_entry` | Committed `HYPOTHETICAL_FILL` | **PAPER ENTRY CONFIRMED — DELAYED** · modeled 09:32 EST · ledger recorded 09:45:53 EST · 41 contracts · fill-based target |
+| `paper_entry` | Committed `HYPOTHETICAL_FILL` | **PAPER ENTRY CONFIRMED — DELAYED** · modeled UTC time, ledger receipt time and position size · fill-based target |
 | `paper_no_entry` | Committed `EXPIRED` or `INVALIDATED` for an unfilled idea | **NO PAPER ENTRY** · EXPIRED · entry window elapsed |
-| `paper_exit` | Committed `CLOSED` | **PAPER TRADE CLOSED — DELAYED** · STOP · net −22.69969756 USDT · equity 9,956.4178 USDT |
-| `open_position` | Current saved nonflat book and its last accounted price | **OPEN PAPER POSITION UPDATE** · mark as of 10:15 EST · stale or unverified at check · unrealized P&L and remaining holding time |
+| `paper_exit` | Committed `CLOSED` | **PAPER TRADE CLOSED — DELAYED** · exit reason, net P&L and updated equity |
+| `open_position` | Current saved nonflat book and its last accounted price | **OPEN PAPER POSITION UPDATE** · last accounted mark time · stale or unverified at check · unrealized P&L and remaining holding time |
 
-The entry and exit examples use historical fixture values. `ENTRY_OBSERVED` alone generates no entry alert. A fill suppresses a pending contradictory unfilled alert. Exit messages use the saved gross, fees, funding, liquidation costs and net. Adverse execution is already included in gross. When saved closing equity cannot be reconciled, the alert includes an accounting warning. Updated events add notification evidence to the normal ledger commit. The watchdog opens a read-only snapshot and does no accounting.
+`ENTRY_OBSERVED` alone generates no entry alert. A fill suppresses a pending contradictory unfilled alert. Exit messages use the saved gross, fees, funding, liquidation costs and net. Adverse execution is already included in gross. When saved closing equity cannot be reconciled, the alert includes an accounting warning. Updated events add notification evidence to the normal ledger commit. The watchdog opens a read-only snapshot and does no accounting.
 
 The first lifecycle scan saves a ledger row baseline and lists any positions already open. Those positions can still generate later close alerts or opt-in updates. The cursor follows committed SQLite insert order and the durable queue deduplicates each book, idea and transition. A delayed commit with an older market timestamp can still qualify. Entries precede closes in the queue for the same idea. A retry blocks later alerts for that idea until resolved or exhausted. If a later alert is sent while an earlier category is disabled, the earlier pending alert is superseded. Open-position updates are superseded when flat and carry the price source time and freshness. The original publication baseline remains separate.
 

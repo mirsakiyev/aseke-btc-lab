@@ -33,6 +33,9 @@ def panel():
         ("Learning", "Recurring on" if learning.get("recurring") else "Recurring off" if "recurring" in learning else "Unknown",
          "Research job active" if learning.get("active") else "No active research job recorded"),
     )
+    if producer := report.get("kraken_source_producer"):
+        components += (("Kraken Spot paper source", producer.get("state"),
+                        producer.get("reason") or f"Managed producer · PID {producer.get('pid', '—')}"),)
     st.dataframe([{"Component": name, "State": state or "Unknown", "Detail": detail}
                   for name, state, detail in components], hide_index=True, width="stretch")
     resources = report["resources"]

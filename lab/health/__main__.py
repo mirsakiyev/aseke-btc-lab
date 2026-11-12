@@ -3,6 +3,7 @@ from contextlib import suppress
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -47,8 +48,42 @@ def task_evidence():
         return {}
 
 
+def _check_kraken_paper(db, cfg, root):
+    errors = (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error)
+    keys = ("kraken_source_producer", "kraken_paper", "kraken_paper_notifications")
+    try:
+        from lab.kraken_paper import retirement
+
+        if retirement.history(root=root):
+            return {key: {"state": retirement.STATE} for key in keys}
+    except errors as exc:
+        return {key: {"state": "CHECK_FAILED", "reason": type(exc).__name__} for key in keys}
+    result = {}
+    try:
+        from lab.kraken_paper import managed
+
+        result[keys[0]] = managed.ensure()
+    except errors as exc:
+        result[keys[0]] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+    try:
+        from lab.kraken_paper import worker
+
+        result[keys[1]] = worker.cycle()
+    except errors as exc:
+        result[keys[1]] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+    try:
+        from lab.kraken_paper import notifications
+
+        result[keys[2]] = notifications.collect(db, utc_now(), cfg)
+    except errors as exc:
+        result[keys[2]] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+    return result
+
+
 def check(*, deliver=True, mode="operator"):
     from lab.health.monitor import collect, finding
+    from lab.health import private_telegram
+    from lab.ema_paper import private_notifications
 
     before=time.monotonic()
     cpu=time.process_time()
@@ -60,6 +95,69 @@ def check(*, deliver=True, mode="operator"):
         set_meta(db,"started",started)
         tasks=task_evidence()
         evidence,findings=collect(db,now,started,cfg,tasks)
+        try:
+            private_settings = private_notifications.route(db)
+        except (ValueError, KeyError, OSError):
+            private_settings = None
+            evidence["ema_private_route"] = "INVALID_LOCAL_CONFIGURATION"
+        private_route = private_settings["route_id"] if private_settings else None
+        if mode == "scheduled" and (ROOT.parent / "ema_paper" / "paper.sqlite3").is_file():
+            try:
+                from lab.ema_paper import dispatcher, notifications, proxy_protocol, synthetic_protocol, worker
+
+                if synthetic_protocol.active():
+                    from lab.ema_paper import kraken_reference, recovery_protocol, recovery_runtime, synthetic_runtime
+
+                    synthetic_protocol.load()
+                    evidence["ema_kraken_reference"] = kraken_reference.ensure()
+                    evidence["ema_paper"] = recovery_runtime.cycle() if recovery_protocol.active() else synthetic_runtime.cycle()
+                else:
+                    evidence["ema_paper"] = dispatcher.cycle() if proxy_protocol.amended() else worker.cycle()
+                ema = evidence["ema_paper"]
+                for profile, book_status in ema.get("books", {}).items():
+                    if book_status.get("source_monitor") in {"HEALTHY", "DEGRADED"}:
+                        finding(findings, f"EMA {profile.title()} KuCoin source",
+                                "WARNING" if book_status["source_monitor"] == "DEGRADED" else None,
+                                "Independently licensed KuCoin paper evidence is delayed or incomplete."
+                                if book_status["source_monitor"] == "DEGRADED" else "Timely KuCoin paper evidence restored.")
+                evidence["ema_paper_notifications"] = notifications.collect(db, utc_now(), cfg)
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error) as exc:
+                evidence["ema_paper"] = {"state": "CHECK_FAILED", "reason": f"{type(exc).__name__}: {exc}"}
+            if private_route:
+                try:
+                    current = utc_now()
+                    evidence["ema_private_notifications"] = private_notifications.collect(db, current)
+                    reference = evidence.get("ema_kraken_reference", {})
+                    heartbeat = reference.get("heartbeat", {})
+                    heartbeat_at = heartbeat.get("at")
+                    minute = next((item for item in reference.get("evidence", {}).get("checkpoints", ())
+                                   if item.get("interval_minutes") == 1), {})
+                    closed_at = minute.get("closed_through")
+                    ema = evidence.get("ema_paper", {})
+                    observations = {
+                        "collector": reference.get("state") in {"RUNNING", "RUNNING_IDENTITY_UNVERIFIED", "STARTED"},
+                        "staleness": bool(heartbeat_at and closed_at and minute.get("missing_rows") == 0
+                                          and 0 <= (current - utc(heartbeat_at)).total_seconds() <= 120
+                                          and 0 <= (current - utc(closed_at)).total_seconds() <= 180),
+                        "evaluation": ema.get("state") == "CHECKED" and all(
+                            book.get("state") not in {"BLOCKED_PERMISSION", "BLOCKED_DATA", "WAITING_FOR_RESOURCES"}
+                            and not (book.get("state") == "WAITING_FOR_DATA" and book.get("first_eligible_at")
+                                     and not ((book.get("source_protocol") or {}).get("chart_recovery") or {}).get("has_discontinuity"))
+                            for book in ema.get("books", {}).values()),
+                        "watchdog": epoch - int(get_meta(db, "ema_private_watchdog_previous", epoch)) <= 420,
+                    }
+                    if ema.get("recovery_amendment_id"):
+                        observations["chart_recovery"] = all(
+                            not ((book.get("source_protocol") or {}).get("chart_recovery") or {}).get("has_discontinuity")
+                            or (book.get("source_protocol") or {}).get("chart_recovery", {}).get("state") == "READY"
+                            for book in ema.get("books", {}).values())
+                    private_notifications.observe(db, current, observations)
+                    set_meta(db, "ema_private_watchdog_previous", epoch)
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+                    evidence["ema_private_notifications"] = {"state": "LOCAL_ERROR", "reason": type(exc).__name__}
+        kraken_root = ROOT.parent / "kraken_paper"
+        if mode == "scheduled" and (kraken_root / "paper.sqlite3").is_file():
+            evidence.update(_check_kraken_paper(db, cfg, kraken_root))
         queried = all(tasks.get(name, {}).get("state", "UNKNOWN") != "UNKNOWN" for name in TASKS[:2])
         finding(findings, "Task Scheduler evidence", None if queried else "WARNING",
                 "Collector task states checked." if queried else "Could not verify both collector task states.")
@@ -71,7 +169,19 @@ def check(*, deliver=True, mode="operator"):
         observe(db,findings,epoch,cfg)
         db.commit()
         if deliver:
-            flush(db,time.time(),cfg,send,clock=time.time)
+            route = None
+            if private_route and db.execute("SELECT 1 FROM outbox WHERE id LIKE 'ema-private:%' "
+                                            "AND status IN ('PENDING','RETRY') AND due<=? LIMIT 1", (epoch,)).fetchone():
+                try:
+                    candidate = private_telegram.destination()
+                    if candidate.identifier == private_route:
+                        route = candidate
+                    else:
+                        evidence["ema_private_route"] = "ROUTE_CHANGED_LOCAL_ONLY"
+                except (OSError, ValueError):
+                    evidence["ema_private_route"] = "ROUTE_VERIFICATION_FAILED_LOCAL_ONLY"
+            flush(db,time.time(),cfg,send,clock=time.time, private_route_id=route.identifier if route else None,
+                  private_send=(lambda text: private_telegram.send(route, text)) if route else None)
         completed=utc_now()
         result={**evidence,"mode":mode,"completed_at":completed.isoformat(),"pid":os.getpid(),
                 "wall_seconds":round(time.monotonic()-before,2),"cpu_seconds":round(time.process_time()-cpu,2),
@@ -130,6 +240,7 @@ def main():
     sub=parser.add_subparsers(dest="command",required=True)
     for name in ("status","test-telegram","dashboard-status","recover-dashboard","stop-local","task-status"):
         sub.add_parser(name)
+    sub.add_parser("enable-ema-private-telegram", help="verify the existing private route and baseline new EMA events")
     sub.add_parser("alerts").add_argument("--idea", help="Show delivery attempts for one full paper idea ID")
     run=sub.add_parser("check-once")
     run.add_argument("--no-send",action="store_true")
@@ -160,6 +271,14 @@ def main():
     elif command=="audit":
         from lab.health.monitor import overnight
         result=overnight(utc(args.start),utc_now())
+    elif command == "enable-ema-private-telegram":
+        from lab.ema_paper import private_notifications
+        from lab.health import private_telegram
+
+        route = private_telegram.destination()
+        with writer_lock(ROOT/".check.lock"), connect() as db, db:
+            enabled = private_notifications.enable(db, route.identifier, utc_now())
+            result = {"state": "PRIVATE_SUMMARIES_ENABLED", "enabled_at": enabled["enabled_at"]}
     elif command in {"alerts","test-telegram","mute","category","position-interval"}:
         with writer_lock(ROOT/".check.lock"),connect() as db:
             if command=="alerts":

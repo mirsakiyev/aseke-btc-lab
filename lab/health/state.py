@@ -124,7 +124,7 @@ def observe(db, findings, now, cfg):
             db.execute("UPDATE incident SET opened=? WHERE key=?", (severity,key))
 
 
-def flush(db, now, cfg, send, *, limit=5, only=None, clock=None):
+def flush(db, now, cfg, send, *, limit=5, only=None, clock=None, private_send=None, private_route_id=None):
     db.execute("UPDATE outbox_attempt SET status='UNCERTAIN',detail='Interrupted during a Telegram request' "
                "WHERE status='IN_FLIGHT'")
     db.execute("UPDATE outbox SET status='UNCERTAIN',detail='Interrupted during a Telegram request' WHERE status='IN_FLIGHT'")
@@ -139,6 +139,15 @@ def flush(db, now, cfg, send, *, limit=5, only=None, clock=None):
             break
         if not (row["id"] == only if only else row["category"] == "test" or cfg["categories"].get(row["category"],False)):
             continue
+        sender = send
+        if row["id"].startswith("ema-private:"):
+            try:
+                route = json.loads(row["event_json"] or "{}").get("private_route_id")
+            except (ValueError, AttributeError):
+                route = None
+            if private_send is None or not private_route_id or route != private_route_id:
+                continue
+            sender = private_send
         if row["idea_id"]:
             blockers = db.execute("SELECT id,category FROM outbox WHERE idea_id=? AND rowid<? "
                                   "AND status IN ('PENDING','RETRY') AND category!='open_position'",
@@ -154,7 +163,7 @@ def flush(db, now, cfg, send, *, limit=5, only=None, clock=None):
         db.execute("INSERT INTO outbox_attempt(id,number,dispatch_at,status) VALUES (?,?,?,'IN_FLIGHT')",
                    (row["id"],number,dispatched))
         db.commit()
-        result = send(row["text"])
+        result = sender(row["text"])
         finished = clock() if clock else now
         delay = max(result.retry_after,min(900,30*2**min(row["attempts"],5)))
         delivered = result.api_accepted_at if result.api_accepted_at is not None else (
