@@ -1,5 +1,6 @@
 from contextlib import closing
 from io import StringIO
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -105,6 +106,7 @@ def test_api_acceptance_records_actual_request_and_server_times(ledger, monkeypa
 
     def post(request):
         assert "Telegram request started" in request.content.decode()
+        assert json.loads(request.content)["protect_content"] is False
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 42, "date": 100}})
 
     clock = iter((100.1, 100.8))

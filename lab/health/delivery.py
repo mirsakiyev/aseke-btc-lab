@@ -48,7 +48,8 @@ def send(message, *, transport=None):
             started = wall_time()
             message = f"{message}\nTelegram request started {local(started)}"
             response = client.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id":chat,
-                                   "text":message.replace(token,"[redacted]")[:4000], "link_preview_options":{"is_disabled":True}})
+                                   "text":message.replace(token,"[redacted]")[:4000], "protect_content":False,
+                                   "link_preview_options":{"is_disabled":True}})
             completed = wall_time()
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
         return Delivery("RETRY", "Telegram connection failed before delivery",

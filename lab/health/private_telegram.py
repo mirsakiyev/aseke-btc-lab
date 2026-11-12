@@ -59,7 +59,7 @@ def send(route, message, *, transport=None):
     try:
         with _client(transport) as client:
             response = client.post(f"https://api.telegram.org/bot{route.token}/sendMessage", json={
-                "chat_id": route.chat, "text": message, "protect_content": True,
+                "chat_id": route.chat, "text": message, "protect_content": False,
                 "link_preview_options": {"is_disabled": True},
             })
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):

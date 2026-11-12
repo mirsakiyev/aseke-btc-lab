@@ -23,7 +23,7 @@ def test_private_route_and_message_are_bound_to_same_destination(monkeypatch):
     assert result.state == "DELIVERED" and result.api_accepted_at is not None
     assert calls[0] == ("getChat", {"chat_id": 12345})
     assert calls[1][1]["text"] == private_telegram.CONNECTIVITY_TEXT
-    assert calls[1][1]["protect_content"] is True
+    assert calls[1][1]["protect_content"] is False
     assert "fixture_token" not in repr(route) and "12345" not in repr(route)
 
 
