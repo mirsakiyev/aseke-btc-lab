@@ -24,7 +24,7 @@ if ($command -eq 'install') {
     $poll = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 3)
     $zero = New-TimeSpan -Seconds 0
     $dashboardSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit $zero -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    $watchSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $watchSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -Priority 4 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     $dashboardAction = New-ScheduledTaskAction -Execute $python -Argument '-X utf8 -m lab.health.dashboard_service --scheduled' -WorkingDirectory $PSScriptRoot
     $watchAction = New-ScheduledTaskAction -Execute $python -Argument '-X utf8 -m lab.health check-once --scheduled' -WorkingDirectory $PSScriptRoot
     $definitions = @(
@@ -57,6 +57,43 @@ if ($command -eq 'install') {
     Start-ScheduledTask -TaskName $dashboard -TaskPath '\'
     Start-ScheduledTask -TaskName $watchdog -TaskPath '\'
     & $python -X utf8 -m lab.health task-status
+} elseif ($command -eq 'repair-watchdog-priority') {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Run .\health.ps1 repair-watchdog-priority in an administrator PowerShell as the existing watchdog account.'
+    }
+    $task = Get-ScheduledTask -TaskName $watchdog -TaskPath '\'
+    $runAs = $task.Principal.UserId
+    $sid = if ($runAs -like 'S-1-*') { $runAs } else {
+        ([Security.Principal.NTAccount]::new($runAs)).Translate([Security.Principal.SecurityIdentifier]).Value
+    }
+    if ($sid -ne $identity.User.Value -or $task.Principal.LogonType -ne 'Password' -or
+        $task.Principal.RunLevel -ne 'Limited' -or @($task.Actions).Count -ne 1 -or
+        $task.Actions[0].Execute -ne $python -or $task.Actions[0].Arguments -cne '-X utf8 -m lab.health check-once --scheduled' -or
+        $task.Actions[0].WorkingDirectory -ne $PSScriptRoot -or
+        $task.Settings.MultipleInstances -ne 'IgnoreNew' -or $task.Settings.ExecutionTimeLimit -ne 'PT2M') {
+        throw "Existing $watchdog differs from the expected unattended task."
+    }
+    if ($task.Settings.Priority -ne 4) {
+        $credential = Get-Credential -UserName $identity.Name -Message 'Enter the existing watchdog Windows account password to update its task priority.'
+        if (-not $credential) { throw 'Task credentials were not supplied.' }
+        try {
+            $credentialSid = ([Security.Principal.NTAccount]::new($credential.UserName)).Translate([Security.Principal.SecurityIdentifier]).Value
+            if ($credentialSid -ne $sid) { throw 'Use the existing unattended watchdog account.' }
+            $settings = $task.Settings
+            $settings.Priority = 4
+            Set-ScheduledTask -TaskName $watchdog -TaskPath '\' -Settings $settings -User $identity.Name -Password $credential.GetNetworkCredential().Password | Out-Null
+        } finally { Remove-Variable credential }
+    }
+    $updated = Get-ScheduledTask -TaskName $watchdog -TaskPath '\'
+    if ($updated.Settings.Priority -ne 4 -or $updated.Settings.ExecutionTimeLimit -ne 'PT2M' -or
+        $updated.Settings.MultipleInstances -ne 'IgnoreNew' -or $updated.Principal.LogonType -ne 'Password' -or
+        $updated.Principal.RunLevel -ne 'Limited') {
+        throw 'Verify the unattended watchdog task settings in Task Scheduler.'
+    }
+    [pscustomobject]@{TaskName=$watchdog; Priority=$updated.Settings.Priority; ExecutionTimeLimit=$updated.Settings.ExecutionTimeLimit;
+        MultipleInstances=$updated.Settings.MultipleInstances; NextRun=($updated | Get-ScheduledTaskInfo).NextRunTime}
 } elseif ($command -eq 'start') {
     foreach ($name in $dashboard,$watchdog) { Start-ScheduledTask -TaskName $name -TaskPath '\' }
     & $python -X utf8 -m lab.health task-status

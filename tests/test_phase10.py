@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,7 +12,7 @@ from lab.learning.diagnostics import fixture
 from lab.learning.evaluation import account_replay as flat_account
 from lab.learning.features import build_features
 from lab.learning.simulator import ExecutionAssumptions, run_trade as flat_trade
-from lab.phase10 import worker
+from lab.phase10 import observer, worker
 from lab.phase10.archive import calendar
 from lab.phase10.evaluation import account_replay
 from lab.phase10.partition import Chunk, PartitionedMarket, checked_funding, partition_features
@@ -119,6 +122,163 @@ def test_schedule_id_retries_and_independent_controls(monkeypatch, tmp_path):
     assert worker.controls()["ideas"]["swing"]
     assert calendar()["max_joined_rows_per_basis"] == 650000
     assert min(row["minimum_minutes_per_price_basis_before_training_prefix"] for row in calendar()["folds"]) == 712800
+
+
+def test_one_shot_observer_terminates_without_blocking_or_overlapping(monkeypatch, tmp_path):
+    clock = 0.
+    children = []
+
+    def launch(args, **options):
+        assert args[-3:] == ["lab.phase13", "_observe", "test-launch"]
+        assert options["env"]["__PYVENV_LAUNCHER__"] == observer.sys.executable
+        assert options["creationflags"] & observer.subprocess.NORMAL_PRIORITY_CLASS
+        proc = SimpleNamespace(pid=len(children) + 1, exit_code=None, terminate_calls=0)
+        proc.poll = lambda: proc.exit_code
+
+        def terminate():
+            proc.terminate_calls += 1
+
+        proc.terminate = terminate
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr(observer.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(observer.subprocess, "Popen", launch)
+    supervision = observer.Observer(tmp_path)
+    supervision.tick("test-launch", lambda: True)
+    assert supervision.status["state"] == "RUNNING" and len(children) == 1
+
+    clock = observer.DEADLINE_SECONDS
+    supervision.tick("test-launch", lambda: pytest.fail("Active observer must be checked before new work"))
+    assert supervision.status["state"] == "TIMEOUT_TERMINATING" and children[0].terminate_calls == 1
+    clock += 20
+    supervision.tick("test-launch", lambda: pytest.fail("Termination must be acknowledged before restart"))
+    assert len(children) == 1
+    assert children[0].terminate_calls == 1
+
+    children[0].exit_code = 1
+    supervision.tick("test-launch", lambda: True)
+    assert supervision.status["state"] == "TIMEOUT" and supervision.status["exit_code"] == 1
+    clock += observer.RETRY_SECONDS - 1
+    supervision.tick("test-launch", lambda: pytest.fail("Timeout retries are paced"))
+    clock += 1
+    supervision.tick("test-launch", lambda: True)
+    assert supervision.status["pid"] == 2 and len(children) == 2
+    children[1].exit_code = 0
+    supervision.tick("test-launch", lambda: True)
+    assert supervision.status["state"] == "EXITED"
+
+
+def test_operator_drain_keeps_observer_ownership_until_child_exits(tmp_path):
+    child = SimpleNamespace(exit_code=None)
+    child.poll = lambda: child.exit_code
+    child.terminate = lambda: pytest.fail("A graceful drain must not terminate the observer")
+    supervision = observer.Observer(tmp_path)
+    supervision.child = child
+    supervision.status = {"state": "RUNNING", "pid": 10}
+    assert not supervision.drain()
+    assert supervision.child is child
+    assert supervision.status == {"state": "DRAINING", "pid": 10}
+    child.exit_code = 0
+    assert supervision.drain()
+    assert supervision.child is None
+    assert supervision.status == {"state": "EXITED", "pid": 10, "exit_code": 0}
+
+
+def test_graceful_stop_waits_for_actual_lock_and_preserves_pause(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "STATE", tmp_path)
+    monkeypatch.setattr(worker, "CONTROL", tmp_path / "control.json")
+    monkeypatch.setattr(worker, "RUNTIME", tmp_path / "runtime.json")
+    monkeypatch.setattr(worker, "LOCK", tmp_path / ".worker.lock")
+    monkeypatch.setattr(worker, "OUTPUT", tmp_path / "runs")
+    monkeypatch.setattr(worker, "phase9_controls", lambda: {"monitor": True, "ideas": {}})
+    calls = []
+    clock = [100.]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        calls.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+    worker.set_control("paused", False)
+    active = {"key": "perp-mark", "started_at": "2026-11-13T16:00:00Z"}
+    worker.write_json(worker.RUNTIME, {"pid": 3210, "active_request": active, "worker_stage": "COLLECTING"})
+    with worker.writer_lock(worker.LOCK):
+        result = worker.stop_local(drain_seconds=1)
+        assert result["state"] == "BLOCKED"
+        assert result["writer_lock_held"] and result["paused"]
+        assert result["active_request"] == active and result["pid"] == 3210
+        assert calls == [.5, .5]
+        with pytest.raises(RuntimeError, match="Another writer owns"):
+            with worker.writer_lock(worker.LOCK):
+                pytest.fail("Stopping must never clear an owned writer lock")
+    assert worker.controls()["paused"] and worker.controls()["monitor"]
+    with worker.writer_lock(worker.OUTPUT / ".observer-cycle.lock"):
+        result = worker.stop_local(drain_seconds=1)
+        assert result["state"] == "BLOCKED"
+        assert not result["writer_lock_held"] and result["observer_lock_held"]
+    assert worker.stop_local(drain_seconds=1) == {
+        "state": "STOPPED", "writer_lock_held": False, "observer_lock_held": False, "paused": True,
+    }
+
+
+def test_paused_worker_will_not_spawn_observer_or_start_spaced_request(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "STATE", tmp_path)
+    flags = {"paused": True, "monitor": True}
+    monkeypatch.setattr(worker, "controls", lambda: flags)
+    supervision = SimpleNamespace(status={"state": "WAITING"}, tick=lambda *args: pytest.fail("Observer was spawned"))
+    instance = SimpleNamespace(phase13_observer=supervision, rt={"launch_id": "old-worker"}, remaining=1,
+                               used=0, budget={"maximum_response_bytes": 1, "minimum_spacing_seconds": 1})
+    worker.Worker.observe_registered_research(instance)
+    flags["paused"] = False
+    monkeypatch.setattr(worker.time, "sleep", lambda _: flags.update(paused=True))
+    monkeypatch.setattr(worker, "send", lambda *args: pytest.fail("Request started after the pause"))
+    assert worker.Worker.fetch(instance, None, {"key": "trade"}) is None
+    assert instance.remaining == 1
+
+
+def test_worker_records_admitted_request_until_source_receipt(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker, "STATE", tmp_path)
+    monkeypatch.setattr(worker, "controls", lambda: {"paused": False, "monitor": True})
+    monkeypatch.setattr(worker.time, "sleep", lambda _: None)
+    clock = utc("2026-11-13T16:00:00Z")
+    monkeypatch.setattr(worker, "utc_now", lambda: clock)
+    saved = []
+    instance = SimpleNamespace(rt={}, remaining=1, used=0, raw=tmp_path,
+                               budget={"maximum_response_bytes": 1, "minimum_spacing_seconds": 1})
+    instance.save = lambda: saved.append(instance.rt["active_request"].copy())
+    request = {"key": "perp-mark"}
+
+    def source(*_):
+        assert saved == [{"key": "perp-mark", "started_at": clock.isoformat()}]
+        return {"status": "RECEIVED", "received_at": clock.isoformat()}
+
+    monkeypatch.setattr(worker, "send", source)
+    receipt = worker.Worker.fetch(instance, None, request)
+    assert receipt["request"] == request
+    assert instance.rt["active_request"] is None
+
+
+def test_observer_receipts_keep_only_operational_fields(tmp_path):
+    audit = observer.ObservationAudit(tmp_path, "fixture")
+    with audit.open(), audit.stage("phase15_paper_cycle"):
+        audit.phase15({"opportunities": {"day/fixed": {
+            "state": "WATCHING", "as_of": "2026-11-13T12:02:00+00:00",
+            "source_cutoff": "2026-11-13T12:00:00+00:00", "latest_candle_receipt": "2026-11-13T12:00:45+00:00",
+            "gates": {"completed candle": "PASSED", "feature readiness": "PASSED"},
+            "decision": "NO_TRADE", "category": "NO_QUALIFYING_SETUP",
+            "reason": "private detail", "chart": [{"close": 12345}],
+        }}})
+        with pytest.raises(RuntimeError), audit.stage("source_import"):
+            raise RuntimeError("private source details")
+    messages = (tmp_path / "observer.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(row) for row in messages]
+    assert [row["state"] for row in rows] == ["STARTED", "WATCHING", "STARTED", "FAILED", "COMPLETED"]
+    assert rows[1]["book"] == "day/fixed" and rows[1]["decision"] == "NO_TRADE"
+    assert rows[1]["receipt"] == "2026-11-13T12:00:45+00:00" and rows[1]["feature_readiness"] == "PASSED"
+    assert rows[3]["error"] == "RuntimeError"
+    assert all("private" not in row and "12345" not in row for row in messages)
 
 
 def test_dashboard_changes_controls_without_starting_a_worker(monkeypatch, tmp_path):

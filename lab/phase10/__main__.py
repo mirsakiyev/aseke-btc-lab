@@ -18,8 +18,10 @@ def main():
         return
     parser = argparse.ArgumentParser(prog="phase10")
     commands = parser.add_subparsers(dest="action", required=True)
-    for name in ("status", "start-local", "stop-local", "probe-archive", "requirements", "allow-managed"):
+    for name in ("status", "start-local", "probe-archive", "requirements", "allow-managed"):
         commands.add_parser(name)
+    stop = commands.add_parser("stop-local")
+    stop.add_argument("--drain-seconds", type=int, choices=range(1, 181), metavar="SECONDS")
     process = commands.add_parser("worker")
     process.add_argument("--managed", action="store_true")
     for key in ("monitor", "ideas", "training"):
@@ -53,8 +55,10 @@ def main():
     if args.action in ("monitor", "training", "ideas", "timezone"):
         value = args.value if args.action == "timezone" else args.value == "on"
         result = worker.set_control(args.action, value, getattr(args, "profile", None))
+    elif args.action == "stop-local":
+        result = worker.stop_local(drain_seconds=args.drain_seconds)
     else:
-        result = {"status": worker.status, "start-local": worker.start_local, "stop-local": worker.stop_local,
+        result = {"status": worker.status, "start-local": worker.start_local,
                   "probe-archive": archive.probe, "requirements": archive.calendar}[args.action]()
     print(json.dumps(result, indent=2, default=str))
 

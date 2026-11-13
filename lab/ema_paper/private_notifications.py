@@ -4,6 +4,7 @@ from contextlib import closing
 import json
 from math import isfinite
 import re
+import sqlite3
 
 from lab.config import fingerprint
 from lab.ema_paper import catalog, synthetic_protocol
@@ -145,20 +146,36 @@ def collect(db, now, registrations=None, paper_db=None, *, revision=None):
     if not saved:
         return {"state": "PRIVATE_ROUTE_NOT_ENABLED"}
     now, enabled = utc(now), utc(saved["enabled_at"])
-    revision = synthetic_protocol.load(now=now) if revision is None else revision
-    if saved["revision_id"] != revision["id"]:
-        return {"state": "PRIVATE_ROUTE_REVIEW_REQUIRED"}
     if paper_db is None:
         with closing(catalog.db_open(readonly=True)) as source:
             source.execute("BEGIN")
             return collect(db, now, registrations, source, revision=revision)
+    production = revision is None
+    revision = synthetic_protocol.load(now=now) if production else revision
+    if saved["revision_id"] != revision["id"]:
+        return {"state": "PRIVATE_ROUTE_REVIEW_REQUIRED"}
     result = {"state": "PRIVATE_SUMMARIES_ENABLED", "books": {}}
+    registrations = catalog.registrations(paper_db) if registrations is None else registrations
+    position_revision = None
+    if production:
+        from lab.ema_paper import position_seam, recovery_protocol
+
+        if position_seam.active():
+            try:
+                recovery = recovery_protocol.load(revision, now=now)
+                amendment = position_seam.load(revision, recovery, registrations["position"], now=now)
+                position_revision = amendment["body"]["position"]
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                result["position_seam"] = "BLOCKED_PERMISSION"
     db.execute("SAVEPOINT ema_private_lifecycle")
     try:
         for profile, lane, effective in _checked_books(registrations, revision):
+            if profile == "position" and result.get("position_seam") == "BLOCKED_PERMISSION":
+                continue
             cursor_key = _cursor(effective["id"])
             idea_cursor_key = _cursor(effective["id"], ideas=True)
             idea_start_key = _idea_start(effective["id"])
+            summary_revision = (position_revision or effective) if profile == "position" else effective
             cursor = int(get_meta(db, cursor_key))
             book = lane["book_id"]
             latest = paper_db.execute("SELECT coalesce(max(rowid),0) FROM event WHERE book=?", (book,)).fetchone()[0]
@@ -196,7 +213,7 @@ def collect(db, now, registrations=None, paper_db=None, *, revision=None):
                     if publication is None:
                         continue
                     published = json.loads(publication[0])
-                message = _summary(profile, lane, effective, published, kind, occurred, recorded, body)
+                message = _summary(profile, lane, summary_revision, published, kind, occurred, recorded, body)
                 if message is None:
                     continue
                 category = EVENTS[kind]

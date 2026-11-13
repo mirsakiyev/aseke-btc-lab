@@ -173,7 +173,7 @@ def _legacy_books(now):
 
 
 def _ema_books():
-    from lab.ema_paper import synthetic_protocol, synthetic_runtime
+    from lab.ema_paper import position_seam, synthetic_protocol
     from lab.ema_paper.ledger import report as account_report
     from lab.ema_paper.dispatcher import protocol_status
 
@@ -214,7 +214,7 @@ def _ema_books():
     try:
         registered = {book["profile"]: book["registration"] for book in books.values()}
         runtime = {book["profile"]: book for book in books.values()}
-        read_status = synthetic_runtime.protocol_status if synthetic_protocol.active() else protocol_status
+        read_status = position_seam.protocol_status if synthetic_protocol.active() else protocol_status
         source_protocols = read_status(registrations=registered, runtime_books=runtime)
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         source_protocols = {}

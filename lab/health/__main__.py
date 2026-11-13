@@ -1,14 +1,22 @@
+import sys
+
+_scheduled_trace = None
+if __name__ == "__main__" and "check-once" in sys.argv and "--scheduled" in sys.argv:
+    from lab.health.diagnostics import bootstrap
+
+    _scheduled_trace = bootstrap()
+
 import argparse
-from contextlib import suppress
+from contextlib import closing, suppress
 import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
-import sys
 import time
 from uuid import uuid4
 
+import pandas as pd
 import psutil
 
 from lab.health import dashboard_service as dashboard
@@ -19,33 +27,62 @@ from lab.storage import read_json, utc, utc_now, write_json, writer_lock
 
 TASKS = ("ASEKE BTC Lab - Forward Research", "ASEKE BTC Lab - KuCoin Monitoring",
          "ASEKE BTC Lab - Dashboard", "ASEKE BTC Lab - Health Watchdog")
+WATCHDOG_GRACE_SECONDS = 420
+
+
+def _stage(name, *, reason=None, decisions=None):
+    if _scheduled_trace is not None:
+        _scheduled_trace.record(name, reason=reason, decisions=decisions)
 
 
 def task_evidence():
     names = ",".join(f"'{name}'" for name in TASKS)
-    script = f"""$result = @{{}}
+    script = f"""$ErrorActionPreference = 'Stop'
+    $service = New-Object -ComObject 'Schedule.Service'
+    $service.Connect()
+    $folder = $service.GetFolder('\\')
     foreach ($name in @({names})) {{
         try {{
-            $task = Get-ScheduledTask -TaskName $name -TaskPath '\\' -ErrorAction Stop
-            $result[$name] = @{{state=([string]$task.State).ToUpperInvariant(); logon=[string]$task.Principal.LogonType}}
-            try {{
-                $info = Get-ScheduledTaskInfo -TaskName $name -TaskPath '\\' -ErrorAction Stop
-                $result[$name].result = $info.LastTaskResult
-                $result[$name].last = [string]$info.LastRunTime
-                $result[$name].next = [string]$info.NextRunTime
-            }} catch {{ $result[$name].result = $null }}
+            $task = $folder.GetTask($name)
+            $logon = try {{ $task.Definition.Principal.LogonType }} catch {{ '' }}
+            [Console]::WriteLine(('{{0}}|{{1}}|{{2}}|{{3}}|{{4:o}}|{{5:o}}' -f
+                $name,$task.State,$logon,$task.LastTaskResult,$task.LastRunTime,$task.NextRunTime))
         }} catch {{
-            $result[$name] = @{{state=$(if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {{'MISSING'}} else {{'UNKNOWN'}})}}
+            $exception = $_.Exception
+            while ($exception.InnerException) {{ $exception = $exception.InnerException }}
+            $state = if ($exception.HResult -eq -2147024894) {{ 'MISSING' }} else {{ 'UNKNOWN' }}
+            [Console]::WriteLine(('{{0}}|{{1}}' -f $name,$state))
         }}
-    }}
-    $result | ConvertTo-Json -Compress -Depth 4"""
+    }}"""
     exe=Path(os.environ["WINDIR"])/"System32/WindowsPowerShell/v1.0/powershell.exe"
     try:
         out=subprocess.run([str(exe),"-NoProfile","-NonInteractive","-Command",script],capture_output=True,timeout=12,
                            check=True,creationflags=subprocess.CREATE_NO_WINDOW)
-        return json.loads(out.stdout)
-    except (OSError,subprocess.SubprocessError,ValueError):
+    except (OSError,subprocess.SubprocessError):
         return {}
+    # Windows PowerShell 5.1 JSON serialization can fail even when the native
+    # scheduler query succeeds. The fields emitted above are fixed and ASCII.
+    states = {"1": "DISABLED", "2": "QUEUED", "3": "READY", "4": "RUNNING"}
+    logons = {"1": "Password", "2": "S4U", "3": "Interactive", "4": "Group",
+              "5": "ServiceAccount", "6": "InteractiveOrPassword"}
+    no_task_time = "1899-12-30T00:00:00.0000000"
+    result = {}
+    for line in out.stdout.decode("ascii", errors="replace").splitlines():
+        name, *fields = line.split("|")
+        if name not in TASKS:
+            continue
+        result[name] = {"state": "UNKNOWN"}
+        if fields == ["MISSING"]:
+            result[name]["state"] = "MISSING"
+        elif len(fields) == 5:
+            code, logon, exit_code, last, next_run = fields
+            try:
+                result[name] = {"state": states.get(code, "UNKNOWN"), "logon": logons.get(logon),
+                                "result": int(exit_code), "last": last if last != no_task_time else "",
+                                "next": next_run if next_run != no_task_time else ""}
+            except ValueError:
+                pass
+    return result
 
 
 def _check_kraken_paper(db, cfg, root):
@@ -80,39 +117,141 @@ def _check_kraken_paper(db, cfg, root):
     return result
 
 
+def _kraken_reference_continuity(reference, now, source_root):
+    """Check due minutes by first availability, ignoring minutes still within their allowance."""
+    from lab.kraken_paper import source
+
+    heartbeat_at = reference.get("heartbeat", {}).get("at")
+    minute = next((item for item in reference.get("evidence", {}).get("checkpoints", ())
+                   if item.get("interval_minutes") == 1), {})
+    stream = minute.get("source_id")
+    if not heartbeat_at or not stream or not pd.Timedelta(0) <= now - utc(heartbeat_at) <= source.TIMELY_CHART:
+        return False
+    # Check the previous watchdog interval at the registered receipt deadline.
+    step = pd.Timedelta(minutes=1)
+    due = (now - source.TIMELY_CHART).floor(step)
+    first = due - 3 * step
+    db = source._read_connection(source_root)
+    if db is None:
+        return False
+    with closing(db):
+        timely = db.execute(
+            "SELECT COUNT(*) FROM ("
+            "SELECT o.opened FROM observation o JOIN receipt r ON r.id=o.receipt_id "
+            "WHERE o.stream=? AND o.minutes=1 AND o.opened>=? AND o.opened<? AND r.available<=? "
+            "GROUP BY o.opened HAVING COUNT(*)=1 AND MIN(r.available)<=o.opened+?)",
+            (stream, first.value, due.value, now.value, (step + source.TIMELY_CHART).value),
+        ).fetchone()[0]
+    return timely == 3
+
+
+def _dispatch_ema():
+    evidence = {}
+    baseline = None
+    errors = (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error)
+    try:
+        _stage("evaluation_baseline")
+        from lab.health import evaluation
+
+        baseline = evaluation.baseline(ROOT.parent)
+        _stage("ema_decisions_before_dispatch", decisions={
+            profile: {"boundary": boundary.isoformat(), "observed_at": observed.isoformat(), "outcome": outcome}
+            for profile, (boundary, observed, outcome) in baseline.items()})
+    except errors as exc:
+        _stage("evaluation_baseline_error", reason=type(exc).__name__)
+    try:
+        _stage("ema_import")
+        from lab.ema_paper import synthetic_protocol
+
+        if synthetic_protocol.active():
+            from lab.ema_paper import recovery_protocol, synthetic_runtime
+
+            if recovery_protocol.active():
+                from lab.ema_paper import position_seam
+
+                cycle = position_seam.cycle
+            else:
+                cycle = synthetic_runtime.cycle
+        else:
+            from lab.ema_paper import dispatcher, proxy_protocol, worker
+
+            cycle = dispatcher.cycle if proxy_protocol.amended() else worker.cycle
+        _stage("ema_dispatch")
+        evidence["ema_paper"] = cycle()
+        _stage("ema_dispatch_complete", reason=evidence["ema_paper"].get("state"))
+    except errors as exc:
+        _stage("ema_dispatch_error", reason=type(exc).__name__)
+        evidence["ema_paper"] = {"state": "CHECK_FAILED", "reason": f"{type(exc).__name__}: {exc}"}
+    if _scheduled_trace is not None:
+        try:
+            from lab.health import evaluation
+
+            decisions = {profile: {"boundary": boundary.isoformat(), "observed_at": observed.isoformat(),
+                                   "outcome": outcome, "advanced": (baseline or {}).get(profile, (None,))[0] != boundary}
+                         for profile, (boundary, observed, outcome) in evaluation.baseline(ROOT.parent).items()}
+            _stage("ema_decisions_committed", decisions=decisions)
+        except errors as exc:
+            _stage("ema_decisions_error", reason=type(exc).__name__)
+    try:
+        from lab.ema_paper import synthetic_protocol
+
+        if synthetic_protocol.active():
+            _stage("kraken_reference_supervision")
+            from lab.ema_paper import kraken_reference
+
+            synthetic_protocol.load()
+            reference = kraken_reference.ensure()
+            evidence["ema_kraken_reference"] = reference
+            evidence["ema_kraken_continuity"] = _kraken_reference_continuity(
+                reference, utc_now(), kraken_reference.ROOT / "source")
+            _stage("kraken_reference_complete", reason=reference.get("state"))
+    except errors as exc:
+        _stage("kraken_reference_error", reason=type(exc).__name__)
+        evidence.setdefault("ema_kraken_reference", {"state": "CHECK_FAILED", "reason": type(exc).__name__})
+    return evidence, baseline
+
+
 def check(*, deliver=True, mode="operator"):
+    before=time.monotonic()
+    cpu=time.process_time()
+    _stage("check_lock")
+    with writer_lock(ROOT/".check.lock"):
+        evidence, baseline = {}, None
+        if mode == "scheduled" and (ROOT.parent / "ema_paper" / "paper.sqlite3").is_file():
+            evidence, baseline = _dispatch_ema()
+        return _check_health(evidence, baseline, before=before, cpu=cpu, deliver=deliver, mode=mode)
+
+
+def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
+    from lab.health import incidents
+    _stage("health_import")
     from lab.health.monitor import collect, finding
     from lab.health import private_telegram
     from lab.ema_paper import private_notifications
 
-    before=time.monotonic()
-    cpu=time.process_time()
     now=utc_now()
     epoch=int(now.timestamp())
-    with writer_lock(ROOT/".check.lock"), connect() as db:
+    _stage("outbox_open")
+    with connect() as db:
         cfg=policy()
         started=int(get_meta(db,"started",epoch))
         set_meta(db,"started",started)
+        _stage("task_scheduler_probe")
         tasks=task_evidence()
-        evidence,findings=collect(db,now,started,cfg,tasks)
+        _stage("research_and_service_probes")
+        components,findings=collect(db,now,started,cfg,tasks)
+        evidence.update(components)
         try:
             private_settings = private_notifications.route(db)
         except (ValueError, KeyError, OSError):
             private_settings = None
             evidence["ema_private_route"] = "INVALID_LOCAL_CONFIGURATION"
         private_route = private_settings["route_id"] if private_settings else None
-        if mode == "scheduled" and (ROOT.parent / "ema_paper" / "paper.sqlite3").is_file():
+        if "ema_paper" in evidence:
+            _stage("ema_notification_scan")
             try:
-                from lab.ema_paper import dispatcher, notifications, proxy_protocol, synthetic_protocol, worker
+                from lab.ema_paper import notifications
 
-                if synthetic_protocol.active():
-                    from lab.ema_paper import kraken_reference, recovery_protocol, recovery_runtime, synthetic_runtime
-
-                    synthetic_protocol.load()
-                    evidence["ema_kraken_reference"] = kraken_reference.ensure()
-                    evidence["ema_paper"] = recovery_runtime.cycle() if recovery_protocol.active() else synthetic_runtime.cycle()
-                else:
-                    evidence["ema_paper"] = dispatcher.cycle() if proxy_protocol.amended() else worker.cycle()
                 ema = evidence["ema_paper"]
                 for profile, book_status in ema.get("books", {}).items():
                     if book_status.get("source_monitor") in {"HEALTHY", "DEGRADED"}:
@@ -122,29 +261,22 @@ def check(*, deliver=True, mode="operator"):
                                 if book_status["source_monitor"] == "DEGRADED" else "Timely KuCoin paper evidence restored.")
                 evidence["ema_paper_notifications"] = notifications.collect(db, utc_now(), cfg)
             except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error) as exc:
-                evidence["ema_paper"] = {"state": "CHECK_FAILED", "reason": f"{type(exc).__name__}: {exc}"}
+                evidence["ema_paper_notifications"] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
             if private_route:
                 try:
                     current = utc_now()
                     evidence["ema_private_notifications"] = private_notifications.collect(db, current)
                     reference = evidence.get("ema_kraken_reference", {})
-                    heartbeat = reference.get("heartbeat", {})
-                    heartbeat_at = heartbeat.get("at")
-                    minute = next((item for item in reference.get("evidence", {}).get("checkpoints", ())
-                                   if item.get("interval_minutes") == 1), {})
-                    closed_at = minute.get("closed_through")
                     ema = evidence.get("ema_paper", {})
                     observations = {
                         "collector": reference.get("state") in {"RUNNING", "RUNNING_IDENTITY_UNVERIFIED", "STARTED"},
-                        "staleness": bool(heartbeat_at and closed_at and minute.get("missing_rows") == 0
-                                          and 0 <= (current - utc(heartbeat_at)).total_seconds() <= 120
-                                          and 0 <= (current - utc(closed_at)).total_seconds() <= 180),
+                        "staleness": evidence.get("ema_kraken_continuity", False),
                         "evaluation": ema.get("state") == "CHECKED" and all(
                             book.get("state") not in {"BLOCKED_PERMISSION", "BLOCKED_DATA", "WAITING_FOR_RESOURCES"}
                             and not (book.get("state") == "WAITING_FOR_DATA" and book.get("first_eligible_at")
                                      and not ((book.get("source_protocol") or {}).get("chart_recovery") or {}).get("has_discontinuity"))
                             for book in ema.get("books", {}).values()),
-                        "watchdog": epoch - int(get_meta(db, "ema_private_watchdog_previous", epoch)) <= 420,
+                        "watchdog": epoch - int(get_meta(db, "ema_private_watchdog_previous", epoch)) <= WATCHDOG_GRACE_SECONDS,
                     }
                     if ema.get("recovery_amendment_id"):
                         observations["chart_recovery"] = all(
@@ -157,7 +289,21 @@ def check(*, deliver=True, mode="operator"):
                     evidence["ema_private_notifications"] = {"state": "LOCAL_ERROR", "reason": type(exc).__name__}
         kraken_root = ROOT.parent / "kraken_paper"
         if mode == "scheduled" and (kraken_root / "paper.sqlite3").is_file():
+            _stage("retired_kraken_status")
             evidence.update(_check_kraken_paper(db, cfg, kraken_root))
+        if mode == "scheduled":
+            _stage("evaluation_freshness")
+            db.execute("SAVEPOINT evaluation_freshness")
+            try:
+                from lab.health import evaluation
+
+                evidence["evaluation_freshness"] = evaluation.record(
+                    db, ROOT.parent, utc_now(), private_route=private_route, baseline=baseline, group_breakout=True)
+            except (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+                db.execute("ROLLBACK TO evaluation_freshness")
+                evidence["evaluation_freshness"] = {"state": "EVIDENCE_UNAVAILABLE", "reason": type(exc).__name__}
+            finally:
+                db.execute("RELEASE evaluation_freshness")
         queried = all(tasks.get(name, {}).get("state", "UNKNOWN") != "UNKNOWN" for name in TASKS[:2])
         finding(findings, "Task Scheduler evidence", None if queried else "WARNING",
                 "Collector task states checked." if queried else "Could not verify both collector task states.")
@@ -166,9 +312,13 @@ def check(*, deliver=True, mode="operator"):
                 if key in findings:
                     severity, detail, _ = findings[key]
                     finding(findings, key, severity, detail)
-        observe(db,findings,epoch,cfg)
+        evidence["health_checks"] = findings
+        grouped = incidents.consolidate(findings, evidence, utc_now())
+        incidents.adopt_legacy(db, grouped, epoch)
+        observe(db, grouped, epoch, cfg, episode_only=incidents.GROUPS)
         db.commit()
         if deliver:
+            _stage("telegram_delivery")
             route = None
             if private_route and db.execute("SELECT 1 FROM outbox WHERE id LIKE 'ema-private:%' "
                                             "AND status IN ('PENDING','RETRY') AND due<=? LIMIT 1", (epoch,)).fetchone():
@@ -183,6 +333,7 @@ def check(*, deliver=True, mode="operator"):
             flush(db,time.time(),cfg,send,clock=time.time, private_route_id=route.identifier if route else None,
                   private_send=(lambda text: private_telegram.send(route, text)) if route else None)
         completed=utc_now()
+        _stage("watchdog_receipt")
         result={**evidence,"mode":mode,"completed_at":completed.isoformat(),"pid":os.getpid(),
                 "wall_seconds":round(time.monotonic()-before,2),"cpu_seconds":round(time.process_time()-cpu,2),
                 **status(db)}
@@ -195,6 +346,78 @@ def view():
     # queries Telegram or drives checks.
     path=ROOT/"last.json"
     return read_json(path) if path.exists() else {"state":"NO_WATCHDOG_RECEIPT"}
+
+
+def _ema_evaluation_status(books, now):
+    result = {}
+    for profile, (saved, decision_seconds) in books.items():
+        checked = saved.get("last_checked_at")
+        evaluated = saved.get("last_evaluated_at")
+        signal = saved.get("last_signal") or {}
+        state = saved.get("state", "NOT_CHECKED")
+        if state == "ACTIVE":
+            cutoff = now - pd.Timedelta(seconds=WATCHDOG_GRACE_SECONDS)
+            overdue = not evaluated or utc(evaluated) <= cutoff - pd.Timedelta(seconds=2 * decision_seconds)
+            if not checked or utc(checked) < cutoff or overdue:
+                state = "DISPATCHER_STALLED"
+            elif signal.get("decision") == "NO_TRADE" and signal.get("observed_at"):
+                state = "NO_TRADE"
+            else:
+                state = "EVALUATING"
+        result[profile] = {
+            "state": state,
+            "last_checked_at": checked,
+            "last_evaluated_at": evaluated,
+            "last_decision": signal.get("decision"),
+            "next_evaluation_at": saved.get("next_evaluation_at"),
+        }
+    return result
+
+
+def _operational_status():
+    """Read current component receipts independently of the last full watchdog check."""
+    result = {}
+    ema_root = ROOT.parent / "ema_paper"
+    if (ema_root / "paper.sqlite3").is_file():
+        try:
+            from lab.ema_paper import catalog, worker
+
+            with closing(catalog.db_open(readonly=True, root=ema_root)) as db:
+                books = {}
+                for profile, registration in catalog.registrations(db).items():
+                    lane = registration["body"]
+                    books[profile] = (worker._record(db, "readiness", lane["book_id"]),
+                                      lane["execution_clock"]["decision_seconds"])
+            result["ema_evaluation"] = _ema_evaluation_status(books, utc_now())
+        except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error):
+            result["ema_evaluation"] = {"state": "EVIDENCE_UNAVAILABLE"}
+    reference_root = ROOT.parent / "ema_kraken_reference"
+    if (reference_root / "reference-heartbeat.json").is_file():
+        try:
+            from lab.ema_paper import kraken_reference
+
+            reference = kraken_reference.status(root=reference_root)
+            healthy = _kraken_reference_continuity(reference, utc_now(), reference_root / "source")
+            result["kraken_reference"] = {
+                "state": "HEALTHY" if healthy else "INTERRUPTED",
+                "heartbeat_at": reference.get("heartbeat", {}).get("at"),
+            }
+        except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error):
+            result["kraken_reference"] = {"state": "EVIDENCE_UNAVAILABLE"}
+    outbox = ROOT / "watchdog.sqlite3"
+    if outbox.is_file():
+        try:
+            with closing(sqlite3.connect(outbox.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
+                result["telegram_trade_delivery"] = [
+                    {"category": category, "state": state, "count": count}
+                    for category, state, count in db.execute(
+                        "SELECT category,status,COUNT(*) FROM outbox "
+                        "WHERE category IN ('ideas','paper_entry','paper_no_entry','paper_exit','open_position') "
+                        "GROUP BY category,status ORDER BY category,status")
+                ]
+        except (OSError, sqlite3.Error):
+            result["telegram_trade_delivery"] = {"state": "EVIDENCE_UNAVAILABLE"}
+    return result
 
 
 def stop_local():
@@ -259,7 +482,7 @@ def main():
     if command=="check-once":
         result=check(deliver=not args.no_send,mode="scheduled" if args.scheduled else "local" if args.local else "operator")
     elif command=="status":
-        result={"latest":view(),"settings":policy()}
+        result={"latest":view(),"current":_operational_status(),"settings":policy()}
     elif command=="task-status":
         result=task_evidence()
     elif command=="dashboard-status":
@@ -301,7 +524,10 @@ def main():
 
 if __name__=="__main__":
     try:
+        _stage("imports_complete")
         main()
-    except (OSError,RuntimeError,ValueError,psutil.Error) as exc:
+        _stage("completed", reason="EXIT_0")
+    except (OSError,RuntimeError,ValueError,sqlite3.Error,psutil.Error) as exc:
+        _stage("failed", reason=type(exc).__name__)
         print(f"Health command could not complete: {type(exc).__name__}",file=sys.stderr)
         raise SystemExit(1) from None

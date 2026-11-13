@@ -9,16 +9,117 @@ import pandas as pd
 import psutil
 import pytest
 
-from lab.health import dashboard_service, delivery, monitor, state
+from lab.health import __main__, dashboard_service, delivery, monitor, state
 from lab.health import paper_events
+from lab.health.diagnostics import StageLog
 from lab.phase15 import catalog, paper
-from lab.storage import utc
+from lab.storage import utc, writer_lock
 
 
 @pytest.fixture
 def ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "ROOT", tmp_path)
     return state.connect
+
+
+@pytest.mark.parametrize(("third_available", "heartbeat_seconds", "corrected", "healthy"), [
+    (40, 10, False, True),
+    (120, 120, False, True),
+    (121, 10, False, False),
+    (None, 10, False, False),
+    (40, 121, False, False),
+    (40, 10, True, False),
+])
+def test_kraken_continuity_waits_for_receipt_deadline(tmp_path, third_available, heartbeat_seconds, corrected, healthy):
+    from lab.kraken_paper import source
+
+    current = utc("2026-11-13T09:56:33Z")
+    checkpoint = current.floor("min")
+    reference = {
+        "heartbeat": {"at": (current - pd.Timedelta(seconds=heartbeat_seconds)).isoformat()},
+        "evidence": {"checkpoints": [{"source_id": "fixture", "interval_minutes": 1,
+                                     "closed_through": checkpoint.isoformat(), "missing_rows": 1, "state": "GAP"}]},
+    }
+    with closing(sqlite3.connect(tmp_path / source.FILE)) as db, db:
+        db.executescript(source.SCHEMA)
+        db.execute("INSERT INTO raw VALUES('raw',X'00')")
+        for i, (offset, seconds) in enumerate(((-5, 40), (-4, 40), (-3, third_available), (-1, 40), (-3, 50))):
+            if seconds is None or (i == 4 and not corrected):
+                continue
+            opened = checkpoint + pd.Timedelta(minutes=offset)
+            closed = opened + pd.Timedelta(minutes=1)
+            available = closed + pd.Timedelta(seconds=seconds)
+            receipt = str(i)
+            db.execute("INSERT INTO receipt VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (receipt, "fixture", 1, closed.value, available.value, available.value,
+                        opened.value, closed.value, 200, "raw"))
+            db.execute("INSERT INTO observation VALUES(?,?,?,?,?)",
+                       ("fixture", 1, opened.value, json.dumps({"fixture": i}), receipt))
+
+    assert __main__._kraken_reference_continuity(reference, current, tmp_path) is healthy
+
+
+def test_status_distinguishes_no_trade_stale_dispatch_and_unready_book():
+    now = utc("2026-11-13T12:04:00Z")
+    evaluated = {"state": "ACTIVE", "last_checked_at": "2026-11-13T12:03:00Z",
+                 "last_evaluated_at": "2026-11-13T12:00:00Z",
+                 "last_signal": {"decision": "NO_TRADE", "observed_at": "2026-11-13T12:02:00Z"}}
+    books = {
+        "day": (evaluated, 900),
+        "swing": ({**evaluated, "last_checked_at": "2026-11-13T11:55:00Z"}, 14400),
+        "position": ({"state": "WAITING_FOR_DATA"}, 86400),
+        "fresh_cycle_stale_boundary": ({**evaluated, "last_evaluated_at": "2026-11-13T11:15:00Z"}, 900),
+    }
+    status = __main__._ema_evaluation_status(books, now)
+    assert {profile: report["state"] for profile, report in status.items()} == {
+        "day": "NO_TRADE", "swing": "DISPATCHER_STALLED", "position": "WAITING_FOR_DATA",
+        "fresh_cycle_stale_boundary": "DISPATCHER_STALLED",
+    }
+    assert status["swing"]["last_decision"] == "NO_TRADE"
+
+
+def test_watchdog_stage_trace_is_bounded_and_records_actual_decisions(tmp_path):
+    trace = StageLog(tmp_path)
+    for _ in range(34):
+        trace.record("check")
+    decisions = {"day": {"boundary": "2026-11-13T12:00:00Z", "outcome": "NO_TRADE", "advanced": True}}
+    trace.record("ema_decisions_committed", decisions=decisions)
+    receipt = json.loads(trace.path.read_text(encoding="utf-8"))
+    assert len(receipt["events"]) == 32
+    assert receipt["events"][-1]["decisions"] == decisions
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_scheduled_check_skips_overlapping_writer_and_runs_ema_before_health(tmp_path, monkeypatch):
+    root = tmp_path / "health"
+    paper_root = tmp_path / "ema_paper"
+    paper_root.mkdir()
+    (paper_root / "paper.sqlite3").touch()
+    monkeypatch.setattr(__main__, "ROOT", root)
+    calls = []
+
+    def dispatch():
+        calls.append("EMA")
+        return {"ema_paper": {"state": "CHECKED"}}, None
+
+    def health(evidence, baseline, **kwargs):
+        assert evidence["ema_paper"]["state"] == "CHECKED"
+        calls.append("health")
+        if len(calls) == 2:
+            raise RuntimeError("fixture failure after EMA commit")
+        return evidence
+
+    monkeypatch.setattr(__main__, "_dispatch_ema", dispatch)
+    monkeypatch.setattr(__main__, "_check_health", health)
+    with writer_lock(root / ".check.lock"):
+        with pytest.raises(RuntimeError, match="Another writer"):
+            __main__.check(mode="scheduled")
+    assert calls == []
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        __main__.check(mode="scheduled")
+    assert (root / ".check.lock").is_file()
+    assert __main__.check(mode="scheduled") == {"ema_paper": {"state": "CHECKED"}}
+    assert calls == ["EMA", "health", "EMA", "health"]
 
 
 def test_incident_debounce_cooldown_recovery_and_restart(ledger):

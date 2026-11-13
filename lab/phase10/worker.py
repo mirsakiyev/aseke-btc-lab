@@ -13,6 +13,7 @@ import pandas as pd
 import psutil
 
 from lab.config import ROOT, fingerprint
+from lab.phase10.observer import Observer
 from lab.phase9.data import candles, inspect_batch, market_quote, mark_quote, metadata
 from lab.phase9.ideas import FINAL, append_event, compute, events, fresh, observation_state, publish
 from lab.phase9.public import INTERVALS, kline, latest, load_payload, plan_requests, send
@@ -154,6 +155,7 @@ def merged_cache(name, old, new, spec, received, sha, close, mode):
 class Worker:
     def __init__(self, runtime, config, parent):
         self.rt, self.cfg, self.parent = runtime, config, parent
+        self.phase13_observer = Observer(ROOT)
         self.policy = config["ideas"]
         self.budget = config["acquisition"]
         self.steps = cadence(config, parent)
@@ -204,9 +206,17 @@ class Worker:
             self.rt["last_error"] = {"at": utc_now().isoformat(), "reason": "KuCoin raw evidence disk ceiling reached"}
             self.rt["retry_at"] = (utc_now() + pd.Timedelta("1h")).isoformat()
             return None
-        self.remaining -= 1
         time.sleep(self.budget["minimum_spacing_seconds"])
-        evidence = send(client, spec, self.budget["maximum_response_bytes"], self.raw)
+        with writer_lock(STATE / ".control.lock"):
+            if controls()["paused"]:
+                return None
+            self.remaining -= 1
+            self.rt["active_request"] = {"key": spec["key"], "started_at": utc_now().isoformat()}
+            self.save()
+        try:
+            evidence = send(client, spec, self.budget["maximum_response_bytes"], self.raw)
+        finally:
+            self.rt["active_request"] = None
         if evidence.get("raw_sha256"):
             path = self.raw / f'{evidence["raw_sha256"]}.json'
             if evidence["raw_sha256"] not in self.seen:
@@ -393,7 +403,8 @@ class Worker:
 
     def admit_research(self):
         from lab.phase10.research import should_run
-        if not any(controls()["training"].values()):
+        flags = controls()
+        if flags["paused"] or not any(flags["training"].values()):
             return
         if getattr(self, "supervisor", None) and self.supervisor.poll() is None:
             return
@@ -407,14 +418,15 @@ class Worker:
     def observe_registered_research(self):
         from lab.phase13.observation import scheduled_due
 
-        active = getattr(self, "phase13_observer", None)
-        if (active is not None and active.poll() is None) or not scheduled_due():
-            return
-        self.phase13_observer = subprocess.Popen(
-            [sys.executable, "-X", "utf8", "-m", "lab.phase13", "_observe", self.rt["launch_id"]], cwd=ROOT,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS,
-        )
+        observer = self.phase13_observer
+        previous = observer.status["state"]
+        with writer_lock(STATE / ".control.lock"):
+            if controls()["paused"]:
+                return
+            observer.tick(self.rt["launch_id"], scheduled_due)
+        self.rt["phase13_observer"] = observer.status
+        if observer.status["state"] != previous:
+            LOG.info("Phase 13 observer %s", observer.status)
 
     def manage_active(self, quotes, now):
         for key, idea in list(self.rt.get("active", {}).items()):
@@ -525,41 +537,60 @@ def run(managed=False):
     LOG.addHandler(handler)
     try:
         with writer_lock(LOCK):
-            if controls()["paused"]:
-                return
-            now = utc_now()
-            rt = optional(RUNTIME, {})
-            previous = rt.get("launch_id")
-            rt.update(pid=os.getpid(), created=psutil.Process().create_time(), launcher="scheduled" if managed else "local",
-                      launch_id=uuid4().hex, started_at=now.isoformat(), previous_launch=previous, stopped_at=None)
-            rt.setdefault("profiles", {name: {} for name in NAMES})
-            worker = Worker(rt, reference(), parent_design())
-            worker.seen = {item.stem for item in worker.raw.glob("*.json")}
-            worker.recover_publications()
-            worker.save()
+            activity = STATE / ".activity.lock"
+            with writer_lock(activity):
+                if controls()["paused"]:
+                    return
+                now = utc_now()
+                rt = optional(RUNTIME, {})
+                previous = rt.get("launch_id")
+                rt.update(pid=os.getpid(), created=psutil.Process().create_time(), launcher="scheduled" if managed else "local",
+                          launch_id=uuid4().hex, started_at=now.isoformat(), previous_launch=previous, stopped_at=None,
+                          drain_guard_version=1, active_request=None, worker_stage="STARTING", phase13_observer=None)
+                rt.setdefault("profiles", {name: {} for name in NAMES})
+                worker = Worker(rt, reference(), parent_design())
+                worker.seen = {item.stem for item in worker.raw.glob("*.json")}
+                worker.recover_publications()
+                worker.save()
             try:
                 with httpx.Client(timeout=5, follow_redirects=False) as client:
-                    while not controls()["paused"]:
-                        try:
-                            worker.seed(utc_now())
-                            worker.cycle(client)
-                            worker.admit_research()
-                        except (ValueError, KeyError, OSError, RuntimeError) as exc:
-                            rt["last_error"] = {"at": utc_now().isoformat(), "reason": str(exc)}
-                            rt["retry_at"] = (utc_now() + pd.Timedelta(seconds=30)).isoformat()
-                            LOG.exception("KuCoin cycle failed")
-                        try:
-                            worker.observe_registered_research()
-                        except (ValueError, KeyError, OSError, RuntimeError):
-                            LOG.exception("Phase 13 observation launch failed")
-                        worker.save()
+                    while True:
+                        with writer_lock(activity):
+                            if controls()["paused"]:
+                                break
+                            try:
+                                rt["worker_stage"] = "COLLECTING"
+                                worker.seed(utc_now())
+                                worker.cycle(client)
+                                worker.admit_research()
+                            except (ValueError, KeyError, OSError, RuntimeError) as exc:
+                                rt["last_error"] = {"at": utc_now().isoformat(), "reason": str(exc)}
+                                rt["retry_at"] = (utc_now() + pd.Timedelta(seconds=30)).isoformat()
+                                LOG.exception("KuCoin cycle failed")
+                            try:
+                                if not controls()["paused"]:
+                                    worker.observe_registered_research()
+                            except (ValueError, KeyError, OSError, RuntimeError):
+                                LOG.exception("Phase 13 observation launch failed")
+                            rt["worker_stage"] = "IDLE"
+                            worker.save()
                         for _ in range(POLL_SECONDS):
                             if controls()["paused"]:
                                 break
                             time.sleep(1)
             finally:
-                rt["stopped_at"] = utc_now().isoformat()
-                worker.save()
+                if not worker.phase13_observer.drain():
+                    with writer_lock(activity):
+                        rt["worker_stage"] = "DRAINING_OBSERVER"
+                        rt["phase13_observer"] = worker.phase13_observer.status
+                        worker.save()
+                    while not worker.phase13_observer.drain():
+                        time.sleep(1)
+                with writer_lock(activity):
+                    rt["worker_stage"] = "STOPPED"
+                    rt["phase13_observer"] = worker.phase13_observer.status
+                    rt["stopped_at"] = utc_now().isoformat()
+                    worker.save()
                 LOG.info("KuCoin worker stopped")
     finally:
         handler.close()
@@ -581,10 +612,35 @@ def start_local():
     raise RuntimeError("KuCoin worker did not acquire its lock")
 
 
-def stop_local():
+def _drain(seconds):
     set_control("paused", True)
-    for _ in range(25):
-        if not process_state()[1]:
-            return status()
-        time.sleep(.5)
-    raise RuntimeError("Worker is still draining its current request")
+    deadline = time.monotonic() + seconds
+    while True:
+        rt = optional(RUNTIME, {})
+        worker_owned = True
+        observer_owned = None
+        try:
+            with writer_lock(LOCK):
+                worker_owned = False
+                with writer_lock(OUTPUT / ".observer-cycle.lock"):
+                    return {"state": "STOPPED", "writer_lock_held": False, "observer_lock_held": False, "paused": True}
+        except RuntimeError:
+            if not worker_owned:
+                observer_owned = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                owner = "Worker" if worker_owned else "Observer"
+                return {"state": "BLOCKED", "writer_lock_held": worker_owned, "observer_lock_held": observer_owned,
+                        "paused": True, "reason": f"{owner} lock still held at the graceful shutdown deadline",
+                        **{field: rt.get(field) for field in ("pid", "launch_id", "heartbeat", "active_request",
+                                                            "phase13_observer", "worker_stage")}}
+            time.sleep(min(.5, remaining))
+
+
+def stop_local(*, drain_seconds=None):
+    result = _drain(12.5 if drain_seconds is None else drain_seconds)
+    if drain_seconds is not None:
+        return result
+    if result["state"] == "BLOCKED":
+        raise RuntimeError("Worker is still draining its current request")
+    return status()

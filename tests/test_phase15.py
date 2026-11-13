@@ -389,6 +389,117 @@ def test_cycle_publishes_then_accounts_once_and_keeps_user_reporting_separate(st
         assert paper.book_report(db, state["swing/fixed"])["counts"] == {}
 
 
+def test_fixture_breakout_through_committed_lifecycle_and_telegram_retry(state, tmp_path, monkeypatch):
+    import json
+    import time
+
+    from lab.health import delivery, monitor, state as outbox
+    from lab.storage import file_hash
+
+    cutoff = utc("2026-11-09T20:00Z")
+    now = cutoff - catalog.QUARTER + pd.Timedelta(seconds=50)
+    closes = pd.date_range(end=cutoff, periods=880, freq=catalog.QUARTER)
+    price = pd.Series([90 + index * .02 + (1.5 if index % 8 < 4 else -1.5) for index in range(len(closes))])
+    frame = pd.DataFrame({"open_at": closes - catalog.QUARTER, "close_at": closes,
+                          "received_at": closes + pd.Timedelta(seconds=45), "open": price,
+                          "high": price + .2, "low": price - .2, "close": price, "volume": 1.,
+                          "raw_sha256": "controlled-fixture"})
+    frame.loc[frame.index[-1], ["open", "high", "low", "close"]] = [110., 110.2, 109.8, 110.]
+    record = {"id": "controlled-fixture", "body": {
+        "lanes": state, "start": (cutoff - catalog.QUARTER).isoformat(),
+        "publication_end_exclusive": (cutoff + pd.Timedelta(days=1)).isoformat(),
+        "follow_end_exclusive": (cutoff + pd.Timedelta(days=2)).isoformat(),
+        "holdout_end_exclusive": "2026-11-08T00:00Z", "config": reference(),
+        "max_live_delay_seconds": 300, "max_batch_minutes": 180, "gap_grace_seconds": 2700,
+    }}
+    metadata = {"as_of": cutoff.isoformat(), "contract": {"status": "Open", "multiplier": .001, "lotSize": 1,
+        "tickSize": .1, "maxLeverage": 100, "marketMaxOrderQty": 1000000},
+        "isolated": [{"level": 1, "maxRiskLimit": 250000, "maxLeverage": 100, "maintainMargin": .004}]}
+
+    def inputs(lane, config, at):
+        if lane["profile"] != "day":
+            return cutoff, frame.iloc[:0], None, None
+        latest = (at - pd.Timedelta(seconds=config["ideas"]["completed_candle_grace_seconds"])).floor(catalog.QUARTER)
+        quote_at = latest + pd.Timedelta(seconds=45)
+        receipt = {"at": quote_at.isoformat(), "received_at": quote_at.isoformat()}
+        return latest, frame, {**receipt, "ask": 110.1, "bid": 110., "last": 110.}, {**receipt, "mark": 110.}
+
+    monkeypatch.setattr(catalog, "registered", lambda: record)
+    monkeypatch.setattr(worker, "registered", lambda: record)
+    monkeypatch.setattr(worker, "utc_now", lambda: now)
+    monkeypatch.setattr(worker, "monitoring_controls", lambda: {"monitor": True, "ideas": dict.fromkeys(("day", "swing", "position"), True)})
+    monkeypatch.setattr(worker, "current_inputs", inputs)
+    monkeypatch.setattr(worker.protocol, "current_metadata", lambda: metadata)
+    monkeypatch.setattr(outbox, "ROOT", tmp_path / "watchdog")
+    monkeypatch.setattr(time, "time", lambda: now.timestamp())
+    monkeypatch.setattr(delivery, "wall_time", lambda: now.timestamp())
+    monkeypatch.setattr(delivery, "credentials", lambda: ("fixture-bot-token", "fixture-chat"))
+    ledger_path = tmp_path / "paper.sqlite3"
+    started = int(now.timestamp())
+    sent = []
+
+    def bot_api(request):
+        assert request.url.path == "/botfixture-bot-token/sendMessage"
+        data = json.loads(request.content)
+        assert data["chat_id"] == "fixture-chat"
+        sent.append(data["text"])
+        if len(sent) == 1:
+            return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 60}})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(sent), "date": int(now.timestamp())}})
+
+    def send(text):
+        return delivery.send(text, transport=httpx.MockTransport(bot_api))
+
+    def poll():
+        digest = file_hash(ledger_path)
+        with outbox.connect() as db:
+            result = monitor.paper(now, db, started, outbox.policy(), {})
+            db.commit()
+            outbox.flush(db, now.timestamp(), outbox.policy(), send)
+            rows = [tuple(row) for row in db.execute(
+                "SELECT category,status,attempts FROM outbox ORDER BY rowid")]
+        assert file_hash(ledger_path) == digest
+        return result["notifications"], rows
+
+    first = worker.cycle("scheduled:fixture", allow_spot=False)
+    no_trade = first["opportunities"]["day/fixed"]
+    assert no_trade["decision"] == "NO_TRADE"
+    assert no_trade["gates"]["feature readiness"] == no_trade["gates"]["higher-timeframe direction"] == "PASSED"
+    assert no_trade["category"] == "NO_QUALIFYING_SETUP" and not first["published"]
+    baseline, rows = poll()
+    assert baseline["baseline_rowid"] == baseline["cursor_rowid"] == 0 and not rows and not sent
+
+    now = cutoff + pd.Timedelta(seconds=50)
+    first = worker.cycle("scheduled:fixture", allow_spot=False)
+    signal = first["opportunities"]["day/fixed"]
+    assert signal["category"] == "CLOSED_BREAKOUT" and signal["gates"]["closed range breakout"] == "PASSED"
+    assert set(first["published"]) == {"day/fixed"}
+    idea = first["published"]["day/fixed"]
+    _, rows = poll()
+    assert rows == [("ideas", "RETRY", 1)]
+    assert len(sent) == 1 and idea in sent[0]
+    assert poll()[1] == rows and len(sent) == 1
+
+    open_at, close_at = cutoff + catalog.STEP, cutoff + 2 * catalog.STEP
+    minute_data = {open_at: bar(open_at, price=110., high=110.1, low=109.9), close_at: bar(close_at, price=125.)}
+    monkeypatch.setattr(worker, "futures_window", lambda *_: ({"trade": minute_data, "mark": minute_data}, {}, {}, True))
+    now = cutoff + catalog.QUARTER + pd.Timedelta(seconds=55)
+    assert not worker.cycle("scheduled:fixture", allow_spot=False)["published"]
+    with closing(catalog.db_open(readonly=True)) as db:
+        books = {key: paper.book_report(db, lane) for key, lane in state.items()}
+        assert books["day/fixed"]["counts"] == {"PUBLISHED": 1, "ENTRY_OBSERVED": 1, "HYPOTHETICAL_FILL": 1, "CLOSED": 1}
+        assert books["day/fixed"]["recent_closed"][0]["reason"] == "target"
+        assert books["day/fixed"]["cash_reconciliation_difference"] == pytest.approx(0., abs=1e-9)
+        assert all(not book["counts"] and book["cash"] == 10_000 for key, book in books.items() if key != "day/fixed")
+    last, rows = poll()
+    assert last["cursor_rowid"] == 4
+    assert rows == [("ideas", "DELIVERED", 2), ("paper_entry", "DELIVERED", 1), ("paper_exit", "DELIVERED", 1)]
+    assert sent[0].splitlines()[0] == sent[1].splitlines()[0] and idea in sent[1]
+    assert idea in sent[2] and "PAPER ENTRY CONFIRMED" in sent[2] and "No real exchange order" in sent[2]
+    assert idea in sent[3] and "PAPER TRADE CLOSED" in sent[3] and "Updated paper equity" in sent[3]
+    assert poll() == (last, rows) and len(sent) == 4
+
+
 def test_public_funding_schedule_keeps_missing_and_verified_zero_distinct(state, monkeypatch, tmp_path):
     slot = utc("2026-11-10T00:00Z")
     start, end = slot-catalog.STEP, slot+2*catalog.STEP

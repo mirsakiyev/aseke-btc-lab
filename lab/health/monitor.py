@@ -153,7 +153,8 @@ def kucoin(now,tasks,cfg,findings):
             f"Public monitor {switches['monitor']}, shared collection {control()['enabled']}.")
     return {"task":state,"state":"PAUSED" if paused else "RUNNING" if locked else "STOPPED","pid":worker.get("pid"),
             "launch_id":worker.get("launch_id"),"lock":locked,"heartbeat_age_seconds":hb if hb!=float('inf') else None,
-            "rss_mib":rss(worker.get("pid")),"futures":fut,"spot":spot,"monitor":enabled,"retry_at":worker.get("retry_at")},amendment,native
+            "rss_mib":rss(worker.get("pid")),"futures":fut,"spot":spot,"monitor":enabled,"retry_at":worker.get("retry_at"),
+            "futures_due":futures_due,"spot_due":spot_due},amendment,native
 
 
 def phase14(db,now,amendment,collection,findings):
@@ -230,13 +231,39 @@ def paper(now,db,started,cfg,findings):
             finding(findings,f"Phase 15 {key} accounting","CRITICAL" if severe else "WARNING" if unresolved else None,
                     f"Book {'missing' if missing else info['book_status']}. {info['problem'] or 'Review paper ledger.'}",immediate=severe)
             books[key]={"state":info["book_status"],"problem":info["problem"],"permanent_block":info["permanent_block"],
-                        "published":info["counts"].get("PUBLISHED",0),"accounting_complete":info["accounting_complete"]}
+                        "published":info["counts"].get("PUBLISHED",0),"accounting_complete":info["accounting_complete"],
+                        "requires_protection":bool(info["position"] or info["pending"]),
+                        "last_source_close":info["last_source_close"]}
         lanes = {lane["book_id"]:lane for lane in body["lanes"].values()}
         scan_started = time.perf_counter()
         publications(conn,db,lanes,started,time.time())
         baseline = scan(conn,db,reg["id"],lanes,records,now,cfg)
         scan_ms = round((time.perf_counter() - scan_started) * 1000, 2)
-    return {"id":reg["id"],"controls":ctl,"publication_open":open_window,"books":books,
+    from lab.phase15.catalog import ROOT as paper_root
+
+    receipt = optional(paper_root / "last-managed.json") or {}
+    qualified_decisions = {}
+    for name in body["lanes"]:
+        opportunity = receipt.get("opportunities", {}).get(name, {})
+        cutoff = opportunity.get("source_cutoff")
+        if not cutoff or not receipt.get("at") or not opportunity.get("latest_candle_receipt"):
+            continue
+        observed = utc(opportunity.get("as_of", receipt["at"]))
+        window = pd.Timedelta(seconds=body["max_live_delay_seconds"])
+        if (opportunity.get("gates", {}).get("feature readiness") == "PASSED"
+                and utc(cutoff) <= utc(opportunity["latest_candle_receipt"]) <= observed <= utc(cutoff) + window
+                and utc(body["start"]) <= utc(cutoff) < utc(body["publication_end_exclusive"])):
+            qualified_decisions[name] = observed.isoformat()
+    managed = {**{key: receipt.get(key) for key in ("at", "launcher", "registration", "requested_boundary")},
+               "advanced": sorted(qualified_decisions)}
+    cache_key = "phase15_health_qualified_decision:" + reg["id"]
+    if receipt.get("registration") == reg["id"] and qualified_decisions:
+        latest = max(qualified_decisions.values())
+        set_meta(db, cache_key, json.dumps({"launcher": managed["launcher"], "at": latest}))
+    prior = json.loads(get_meta(db, cache_key, "{}"))
+    if prior.get("launcher") == managed["launcher"]:
+        managed["last_qualified_decision_at"] = prior.get("at")
+    return {"id":reg["id"],"controls":ctl,"publication_open":open_window,"books":books,"managed":managed,
             "notifications":baseline,"notification_scan_ms":scan_ms}
 
 

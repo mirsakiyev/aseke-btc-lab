@@ -42,6 +42,8 @@ def _parser():
     live = commands.add_parser("synthetic-status")
     live.add_argument("--book", choices=catalog.PROFILES)
     commands.add_parser("commission-chart-recovery", help="append the chart-operations amendment for existing synthetic books")
+    commands.add_parser("commission-position-seam", help="append the future UTC daily seam for the original EMA Position book")
+    commands.add_parser("prepare-position-history", help="fetch the missed daily candle as feature-only context")
     events = commands.add_parser("events")
     events.add_argument("--book", choices=catalog.PROFILES, required=True)
     events.add_argument("--limit", type=int, choices=range(1, 101), default=20, metavar="1–100")
@@ -59,7 +61,7 @@ def _summary(records):
 
 
 def _run(args):
-    from lab.ema_paper import recovery_protocol, recovery_runtime, synthetic_runtime
+    from lab.ema_paper import position_seam, recovery_protocol
 
     synthetic = synthetic_protocol.active()
     if args.action == "register":
@@ -83,22 +85,32 @@ def _run(args):
     if args.action == "synthetic-status":
         if not synthetic:
             return {"state": "UNREGISTERED"}
-        value = synthetic_runtime.protocol_status()
+        value = position_seam.protocol_status()
         return value[args.book] if args.book else value
     if args.action == "commission-chart-recovery":
         saved = recovery_protocol.register()
         return {"amendment_id": saved["id"], "recorded_at": saved["body"]["recorded_at"],
                 "predecessor": saved["body"]["predecessor"], "protocol": saved["body"]["version"]}
+    if args.action == "commission-position-seam":
+        saved = position_seam.register()
+        record = saved["body"]["position"]["body"]
+        seam = synthetic_protocol.utc(record["seed_end"])
+        return {"amendment_id": saved["id"], "book_id": record["book_id"], "seam": seam.isoformat(),
+                "earliest_possible_decision_at": (seam + position_seam.DAY).isoformat()}
+    if args.action == "prepare-position-history":
+        return position_seam.prepare_history()
     if args.action == "proxy-status":
         status = dispatcher.protocol_status()
         if synthetic:
-            effective = synthetic_runtime.protocol_status()
+            effective = position_seam.protocol_status()
             for profile in status:
                 status[profile]["effective_synthetic_protocol"] = effective[profile]
         return status[args.book] if args.book else status
     if args.action == "run-once":
         if synthetic:
-            return recovery_runtime.cycle() if recovery_protocol.active() else synthetic_runtime.cycle()
+            from lab.ema_paper import synthetic_runtime
+
+            return position_seam.cycle() if recovery_protocol.active() else synthetic_runtime.cycle()
         if proxy_protocol.amended():
             return dispatcher.cycle()
         return worker.cycle()
@@ -108,7 +120,7 @@ def _run(args):
         return report()
     if args.action == "status":
         value = worker.status()
-        source_status = synthetic_runtime.protocol_status if synthetic else dispatcher.protocol_status
+        source_status = position_seam.protocol_status if synthetic else dispatcher.protocol_status
         for profile, item in source_status(runtime_books=value["books"]).items():
             if item["amendment_id"]:
                 value["books"][profile]["source_protocol"] = item

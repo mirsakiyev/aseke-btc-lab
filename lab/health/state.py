@@ -81,7 +81,7 @@ def enqueue(db, identifier, category, message, now, *, incident=None, kind="even
                (identifier,category,message,incident,kind,now,now,idea_id,transition,event_json))
 
 
-def observe(db, findings, now, cfg):
+def observe(db, findings, now, cfg, *, episode_only=()):
     for key, (severity, detail, immediate) in findings.items():
         row = db.execute("SELECT * FROM incident WHERE key=?", (key,)).fetchone()
         if not severity:
@@ -116,7 +116,8 @@ def observe(db, findings, now, cfg):
         if escalation:
             db.execute("UPDATE outbox SET status='SUPERSEDED' WHERE incident=? AND kind='incident' AND status IN ('PENDING','RETRY')",(key,))
         first = not row["opened"]
-        reminder = (not pending and row["notified"] is not None and now-row["notified"]>=cfg["reminder_minutes"]*60)
+        reminder = (key not in episode_only and not pending and row["notified"] is not None
+                    and now-row["notified"]>=cfg["reminder_minutes"]*60)
         if first or escalation or reminder:
             suffix = severity if first or escalation else f"reminder:{now}"
             enqueue(db,episode+":"+suffix,"health",f"ASEKE BTC LAB — {severity}\n{key}\n{detail}\n"
@@ -203,5 +204,7 @@ def status(db, *, idea=None):
                 "SELECT number,dispatch_at,request_started,request_completed,api_accepted_at,telegram_date,status,detail "
                 "FROM outbox_attempt WHERE id=? ORDER BY number", (row["id"],))]
     return {"incidents":incidents,"delivery_counts":counts,"recent_alerts":alerts,
-            "last_delivery":get_meta(db,"last_delivery"),"last_recovery":db.execute("SELECT max(recovered) FROM incident WHERE opened IS NOT NULL").fetchone()[0],
+            "last_delivery":get_meta(db,"last_delivery"),"last_recovery":db.execute(
+                "SELECT max(recovered) FROM incident WHERE opened IS NOT NULL AND detail NOT LIKE 'Consolidated under %'"
+            ).fetchone()[0],
             "paper_notifications":json.loads(get_meta(db,"paper_lifecycle","null"))}

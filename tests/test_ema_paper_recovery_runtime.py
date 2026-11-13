@@ -1,18 +1,22 @@
 from contextlib import closing
-from dataclasses import replace
 import json
 import time
 
+import httpx
 import pandas as pd
+import pytest
 
-from lab.ema_paper import catalog, recovery_runtime, synthetic_protocol, synthetic_runtime, worker
+from lab.config import fingerprint
+from lab.ema_paper import catalog, private_notifications, recovery_runtime, synthetic_protocol, synthetic_runtime, worker
+from lab.health import private_telegram, state
 from lab.phase15 import paper
 from lab.strategy_lab.market_data import MarketData, Observation, Purpose
 from test_cross_venue_warmup import RAW, RAW_HASH, SEAM, STEP, snapshot
 from test_ema_paper_worker import registered
 
 
-def test_repair_resumes_future_only_and_keeps_protection_separate(registered):
+@pytest.mark.parametrize("signal_volume", [10_000., 1.], ids=["qualifying-signal", "no-trade"])
+def test_repair_resumes_future_only_and_keeps_protection_separate(registered, monkeypatch, signal_volume):
     root, _, _, _, originals = registered
     original = originals["day"]
     lane = original["body"]
@@ -24,6 +28,16 @@ def test_repair_resumes_future_only_and_keeps_protection_separate(registered):
     rows = list(archive.observations)
     minute = pd.Timedelta(minutes=1)
     gap, repair_context, resume = SEAM + STEP, SEAM + 2 * STEP, SEAM + 3 * STEP
+    books = {profile: synthetic_protocol._lane(record, {"id": "fixture predecessor"}, archive.source,
+                                               SEAM - pd.Timedelta(minutes=5))
+             for profile, record in originals.items()}
+    assert books["day"] == amendment
+    revision_body = {"books": books}
+    revision = {"id": fingerprint(revision_body), "body": revision_body}
+    route = private_telegram.Route("a" * 64, 123, "fixture-token")
+    monkeypatch.setattr(state, "ROOT", root.parent / "watchdog")
+    with closing(catalog.db_open(root=root)) as journal, state.connect() as outbox:
+        private_notifications.enable(outbox, route.identifier, SEAM, originals, journal, revision=revision)
     for opened in pd.date_range(scopes[Purpose.EXECUTION_EVIDENCE].start, resume + 2 * STEP, freq=minute):
         closed = opened + minute
         rows.append(Observation(archive.source.id, synthetic_protocol.TRADE, opened, closed, closed + pd.Timedelta(seconds=3),
@@ -33,7 +47,7 @@ def test_repair_resumes_future_only_and_keeps_protection_separate(registered):
         arrived = closed + pd.Timedelta(seconds=5)
         rows.append(Observation(archive.source.id, synthetic_protocol.TRADE, closed - STEP, closed, arrived, arrived,
                                 RAW_HASH, {"open": 108., "high": 110., "low": 95. if index == 0 else 106.,
-                                           "close": 109., "volume": 10_000. if index == 1 else 50.}))
+                                           "close": 109., "volume": signal_volume if index == 1 else 50.}))
 
     class Provider:
         def read(self, kind, start, end, as_of, interval):
@@ -64,6 +78,13 @@ def test_repair_resumes_future_only_and_keeps_protection_separate(registered):
     first = run(resume + minute)
     assert first["state"] == "ACTIVE", first["reason"]
     assert run(resume + minute)["state"] == "ACTIVE"
+    if signal_volume == 1.:
+        with closing(catalog.db_open(True, root=root)) as journal, state.connect() as outbox:
+            assert worker._record(journal, "readiness", lane["book_id"])["last_signal"]["decision"] == "NO_TRADE"
+            private_notifications.collect(outbox, resume + minute, originals, journal, revision=revision)
+            assert journal.execute("SELECT count(*) FROM event").fetchone() == (0,)
+            assert outbox.execute("SELECT count(*) FROM outbox").fetchone()[0] == 0
+        return
     with closing(catalog.db_open(True, root=root)) as db:
         assert catalog.registrations(db) == originals
         fixed = worker._record(db, "eligibility", lane["book_id"])
@@ -79,6 +100,39 @@ def test_repair_resumes_future_only_and_keeps_protection_separate(registered):
     with closing(catalog.db_open(True, root=root)) as db:
         assert db.execute("SELECT count(*) FROM event WHERE kind='HYPOTHETICAL_FILL'").fetchone() == (1,)
         assert paper.load(db, originals["swing"]["body"])["equity"] == 10000
+
+    messages = []
+
+    def post(request):
+        payload = json.loads(request.content)
+        assert payload["chat_id"] == 123
+        assert payload["protect_content"] is False
+        messages.append(payload["text"])
+        if len(messages) == 1:
+            return httpx.Response(429, json={"parameters": {"retry_after": 60}})
+        return httpx.Response(200, json={"ok": True, "result": {
+            "message_id": len(messages), "chat": {"id": 123, "type": "private"}}})
+
+    transport = httpx.MockTransport(post)
+    cfg = {**state.DEFAULTS, "mute": False}
+    collected_at = opening + 2 * minute
+    for delay in (0, 30, 60, 180):
+        now = collected_at + pd.Timedelta(seconds=delay)
+        with closing(catalog.db_open(True, root=root)) as journal, state.connect() as outbox:
+            private_notifications.collect(outbox, now, originals, journal, revision=revision)
+            outbox.commit()
+            state.flush(outbox, now.timestamp(), cfg, None, private_route_id=route.identifier,
+                        private_send=lambda message: private_telegram.send(route, message, transport=transport))
+            if delay in (0, 30):
+                assert state.status(outbox)["delivery_counts"] == {"PENDING": 1, "RETRY": 1}
+    assert len(messages) == 3 and messages[0] == messages[1]
+    assert "SIMULATED PAPER EXPERIMENTAL IDEA" in messages[1]
+    assert "SIMULATED PAPER ENTRY" in messages[2]
+    assert all("EMA Pullback Day 15m · LONG · 3×" in message for message in messages)
+    with state.connect() as outbox:
+        assert state.status(outbox)["delivery_counts"] == {"DELIVERED": 2}
+        assert [tuple(row) for row in outbox.execute("SELECT category,attempts FROM outbox ORDER BY rowid")] == [
+            ("ideas", 2), ("paper_entry", 1)]
 
     # Remove just the next minute from this temporary provider. It must never
     # become a guessed stop or produce a retroactive exit.
