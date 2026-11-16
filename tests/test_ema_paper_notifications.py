@@ -188,9 +188,12 @@ def test_matched_window_uses_eligible_idea_cohorts_and_day_session_slices():
     assert report["session_slices"]["ema_closed_after_breakout_flat"] == 2
 
 
-def test_dashboard_shows_seven_independent_books(monkeypatch):
+def test_dashboard_shows_seven_independent_books(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
 
+    from lab.paper_run import gate
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     books = {}
     for key, label in dashboard.LABELS.items():
         profile = key.split("/")[1] if key.startswith("ema/") else key.split("/")[0]
@@ -211,9 +214,12 @@ def test_dashboard_shows_seven_independent_books(monkeypatch):
     assert table["State"].eq("BLOCKED_PERMISSION").sum() == 3
 
 
-def test_dashboard_distinguishes_kraken_synthetic_economics(monkeypatch):
+def test_dashboard_distinguishes_kraken_synthetic_economics(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
 
+    from lab.paper_run import gate
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     account = paper.initial({"book_id": "ema/day", "risk": {"starting_equity": 10000.}})
     account.update(reserved_margin=25., liquidation_cost=.2)
     protocol = {"synthetic": True, "source_mode": "KRAKEN_SPOT_REFERENCE",

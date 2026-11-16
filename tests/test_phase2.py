@@ -197,8 +197,10 @@ def test_stale_heartbeat_blocks_entries_before_model_access():
 
 def test_dashboard_mode_changes_preserve_shadow_position_and_pnl(tmp_path, monkeypatch):
     from lab import data, research
+    from lab.paper_run import gate
     from lab.phase2 import collector
 
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     p = load_profiles()["day"]
     at = utc("2026-11-08T16:00Z")
     path = tmp_path / "forward.sqlite3"

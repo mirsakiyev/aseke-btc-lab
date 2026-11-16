@@ -89,6 +89,13 @@ def _safe_report():
 
 
 def panel():
+    from lab.paper_run.gate import retired as legacy_retired
+
+    if legacy_retired():
+        from lab.paper_run.presentation import panel as fresh_panel
+
+        fresh_panel()
+        return
     paper_view.panel(additional_report=_safe_report, additional_detail=detail)
     from lab.kraken_paper import retirement
 

@@ -36,6 +36,10 @@ def panel():
     if producer := report.get("kraken_source_producer"):
         components += (("Kraken Spot paper source", producer.get("state"),
                         producer.get("reason") or f"Managed producer · PID {producer.get('pid', '—')}"),)
+    if fresh := report.get("fresh_paper"):
+        runner = report.get("fresh_paper_runner", {})
+        components += (("Fresh paper", runner.get("state") or fresh.get("state"),
+                        f"Current generation {fresh.get('generation_id') or 'pending'}"),)
     st.dataframe([{"Component": name, "State": state or "Unknown", "Detail": detail}
                   for name, state, detail in components], hide_index=True, width="stretch")
     resources = report["resources"]

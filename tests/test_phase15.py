@@ -394,8 +394,10 @@ def test_fixture_breakout_through_committed_lifecycle_and_telegram_retry(state, 
     import time
 
     from lab.health import delivery, monitor, state as outbox
+    from lab.paper_run import gate
     from lab.storage import file_hash
 
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     cutoff = utc("2026-11-09T20:00Z")
     now = cutoff - catalog.QUARTER + pd.Timedelta(seconds=50)
     closes = pd.date_range(end=cutoff, periods=880, freq=catalog.QUARTER)

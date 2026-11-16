@@ -118,6 +118,13 @@ def book_panel(book):
 
 
 def panel():
+    from lab.paper_run.gate import retired
+
+    if retired():
+        from lab.paper_run.presentation import panel as fresh_panel
+
+        fresh_panel(family="breakout")
+        return
     st.title("Trade opportunities")
     data = status()
     profile = st.radio("Profile", tuple(LABELS), format_func=LABELS.get, horizontal=True, key="phase15-profile")

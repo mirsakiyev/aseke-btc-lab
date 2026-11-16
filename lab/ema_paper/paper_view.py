@@ -241,6 +241,10 @@ def _ema_books():
 
 def report(*, now=None):
     """Read the seven-account inventory without updating any ledger."""
+    from lab.paper_run.presentation import current_view
+
+    if (current := current_view()) is not None:
+        return current
     now = utc_now() if now is None else utc(now)
     books, journals = _legacy_books(now)
     current, new_journals = _ema_books()
@@ -435,6 +439,13 @@ def _detail(book, *, currency="USDT"):
 
 @st.fragment(run_every="30s")
 def panel(*, additional_report=None, additional_detail=None):
+    from lab.paper_run.gate import retired
+
+    if retired():
+        from lab.paper_run.presentation import panel as fresh_panel
+
+        fresh_panel()
+        return
     data = report()
     extra = additional_report() if additional_report is not None else {}
     books = {**data["books"], **extra}

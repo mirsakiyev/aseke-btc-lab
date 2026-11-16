@@ -119,8 +119,12 @@ def test_data_warning_and_recovery_count_distinct_committed_checks(tmp_path, mon
         assert health.execute("SELECT COUNT(*) FROM outbox_attempt").fetchone()[0] == 0
 
 
-def test_dashboard_lists_ten_books_with_explicit_quote_and_kraken_evidence(monkeypatch):
+def test_dashboard_lists_ten_books_with_explicit_quote_and_kraken_evidence(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
+
+    from lab.paper_run import gate
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
 
     def record(profile, key, label, quote):
         registration = _registration(profile)

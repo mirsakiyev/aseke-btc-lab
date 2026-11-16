@@ -28,8 +28,9 @@ def _observe(launcher, audit=None):
         return result
 
     with stage("phase15_import"):
+        from lab.paper_run.gate import legacy_entries_closed
         from lab.phase15.catalog import ROOT as paper_root
-    if (paper_root / "registration.json").exists():
+    if not legacy_entries_closed(root=RUNS / "paper-run") and (paper_root / "registration.json").exists():
         try:
             with stage("phase15_paper_cycle"):
                 from lab.phase15.worker import cycle as paper_cycle

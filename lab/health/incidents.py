@@ -83,10 +83,13 @@ def consolidate(findings, evidence, now):
                                   for basis in ("trade", "mark"))
             metrics = ", ".join(f"{basis} missing {view.get('missing', '?')}, max receipt lag {view.get('max_receipt_delay_seconds') or 'unverified'} s"
                                 for basis, view in prices.items())
-            detail = (f"Last on-cadence futures closes: {qualified}. Last managed receipt: {managed.get('at') or 'unverified'}. "
-                      f"Recent metrics: {metrics or 'unverified'}. "
-                      f"Books: {labels}. New entries: {'qualification impaired' if severity else 'usual eligibility gates'}. "
-                      f"Protection: {'degraded for ' + ', '.join(protection) if severity and protection else 'no active exposure reported' if books and not protection else 'verify per book'}.")
+            detail = f"Last on-cadence futures closes: {qualified}. Recent metrics: {metrics or 'unverified'}."
+            if phase15.get("state") == "RETIRED":
+                detail += " Fresh paper price and protection status is reported by the separate forward runner."
+            else:
+                detail += (f" Last managed receipt: {managed.get('at') or 'unverified'}. Books: {labels}. "
+                           f"New entries: {'qualification impaired' if severity else 'usual eligibility gates'}. "
+                           f"Protection: {'degraded for ' + ', '.join(protection) if severity and protection else 'no active exposure reported' if books and not protection else 'verify per book'}.")
         else:
             detail = (f"Last timely native Spot hour: {spot.get('last_qualified_close') or 'unverified'}. "
                       f"Missing hours: {spot.get('missing', 'unverified')}. Affected paper books: none. "

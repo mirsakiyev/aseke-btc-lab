@@ -22,7 +22,14 @@ def main():
     execution.add_argument("--idea", required=True)
     execution.add_argument("--file", type=Path, required=True)
     args = parser.parse_args()
-    if args.command == "control":
+    from lab.paper_run.presentation import current_view
+
+    current = current_view(family="breakout")
+    if current is not None:
+        if args.command not in {"status", "report", "verify", "analyze"}:
+            parser.error("The legacy Phase 15 generation is retired. Use the fresh paper runner for current controls.")
+        value = current
+    elif args.command == "control":
         value = set_control(args.name, args.state == "on")
     elif args.command == "record-execution":
         record = registered()

@@ -95,6 +95,9 @@ def test_run_idempotence_for_missing_data(tmp_path, monkeypatch):
 
 
 def test_dashboard_mode_switch_preserves_originating_position(tmp_path, monkeypatch):
+    from lab.paper_run import gate
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     profiles = load_profiles()
     profile = profiles["position_spot"]
     at = utc("2025-05-01T01:00Z")

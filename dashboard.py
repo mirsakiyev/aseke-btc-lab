@@ -235,11 +235,15 @@ def forward_panel(profile) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="ASEKE BTC Lab", page_icon="₿", layout="wide")
+    from lab.paper_run.gate import retired
+
     profiles = load_profiles()
+    fresh = bool(retired())
+    views = ("Observer", "Research / Learning", "Trade ideas", "Challenger learning",
+             "Native learning readiness", "Operational health", "Strategy Library / Research Lab", "Prospective paper")
     with st.sidebar:
-        view = st.radio("Workspace", ("Observer", "Research / Learning", "Trade ideas", "Challenger learning",
-                                     "Native learning readiness", "Operational health", "Strategy Library / Research Lab",
-                                     "Prospective paper"), key="workspace")
+        view = st.radio("Workspace", views, index=views.index("Prospective paper") if fresh else 0,
+                        key="workspace-fresh" if fresh else "workspace")
         if view == "Research / Learning":
             from lab.learning.dashboard import panel
         elif view == "Trade ideas":

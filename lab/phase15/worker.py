@@ -97,10 +97,16 @@ def advance(db, book, lane, body, end, now, metadata):
 
 
 def cycle(launcher="operator", transport=None, *, allow_spot=True, source_cycle=None):
+    from lab.paper_run.gate import legacy_entries_closed
+
+    if legacy_entries_closed(root=ROOT.parent / "paper-run"):
+        return {"state": "LEGACY_RETIRED"}
     if not (record := registered()):
         return {"state": "UNREGISTERED"}
     body = record["body"]
     with writer_lock(ROOT / ".writer.lock"), closing(db_open()) as db:
+        if legacy_entries_closed(root=ROOT.parent / "paper-run"):
+            return {"state": "LEGACY_RETIRED"}
         now = utc_now()
         flags, monitor = controls(), monitoring_controls()
         start = utc(body["start"])

@@ -204,6 +204,10 @@ def publications(paper,db,lanes,started,now):
 
 
 def paper(now,db,started,cfg,findings):
+    from lab.paper_run.gate import retired
+
+    if marker := retired():
+        return {"state": "RETIRED", "publication_open": False, "books": {}, "archive_id": marker["id"]}
     from lab.health.paper_events import scan
     from lab.phase15.catalog import registered,controls,db_open
     from lab.phase15.paper import book_report

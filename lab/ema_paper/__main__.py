@@ -61,6 +61,16 @@ def _summary(records):
 
 
 def _run(args):
+    from lab.paper_run.presentation import current_view, events
+
+    current = current_view(family=None if args.action == "compare" else "ema")
+    if current is not None:
+        if args.action == "events":
+            return events(f"ema/{args.book}", args.limit)
+        if args.action in {"list", "status", "synthetic-status", "proxy-status", "compare"}:
+            return current["books"].get(f"ema/{args.book}") if getattr(args, "book", None) else current
+        raise PermissionError("The legacy EMA paper generation is retired. Use the fresh paper runner for current controls.")
+
     from lab.ema_paper import position_seam, recovery_protocol
 
     synthetic = synthetic_protocol.active()

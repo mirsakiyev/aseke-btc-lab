@@ -91,6 +91,9 @@ def test_watchdog_stage_trace_is_bounded_and_records_actual_decisions(tmp_path):
 
 
 def test_scheduled_check_skips_overlapping_writer_and_runs_ema_before_health(tmp_path, monkeypatch):
+    from lab.paper_run import gate
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper-run")
     root = tmp_path / "health"
     paper_root = tmp_path / "ema_paper"
     paper_root.mkdir()

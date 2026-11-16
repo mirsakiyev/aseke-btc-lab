@@ -145,10 +145,12 @@ def _kraken_reference_continuity(reference, now, source_root):
     return timely == 3
 
 
+PAPER_ERRORS = (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error)
+
+
 def _dispatch_ema():
     evidence = {}
     baseline = None
-    errors = (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error)
     try:
         _stage("evaluation_baseline")
         from lab.health import evaluation
@@ -157,7 +159,7 @@ def _dispatch_ema():
         _stage("ema_decisions_before_dispatch", decisions={
             profile: {"boundary": boundary.isoformat(), "observed_at": observed.isoformat(), "outcome": outcome}
             for profile, (boundary, observed, outcome) in baseline.items()})
-    except errors as exc:
+    except PAPER_ERRORS as exc:
         _stage("evaluation_baseline_error", reason=type(exc).__name__)
     try:
         _stage("ema_import")
@@ -179,7 +181,7 @@ def _dispatch_ema():
         _stage("ema_dispatch")
         evidence["ema_paper"] = cycle()
         _stage("ema_dispatch_complete", reason=evidence["ema_paper"].get("state"))
-    except errors as exc:
+    except PAPER_ERRORS as exc:
         _stage("ema_dispatch_error", reason=type(exc).__name__)
         evidence["ema_paper"] = {"state": "CHECK_FAILED", "reason": f"{type(exc).__name__}: {exc}"}
     if _scheduled_trace is not None:
@@ -190,8 +192,13 @@ def _dispatch_ema():
                                    "outcome": outcome, "advanced": (baseline or {}).get(profile, (None,))[0] != boundary}
                          for profile, (boundary, observed, outcome) in evaluation.baseline(ROOT.parent).items()}
             _stage("ema_decisions_committed", decisions=decisions)
-        except errors as exc:
+        except PAPER_ERRORS as exc:
             _stage("ema_decisions_error", reason=type(exc).__name__)
+    _supervise_kraken_reference(evidence)
+    return evidence, baseline
+
+
+def _supervise_kraken_reference(evidence):
     try:
         from lab.ema_paper import synthetic_protocol
 
@@ -205,20 +212,38 @@ def _dispatch_ema():
             evidence["ema_kraken_continuity"] = _kraken_reference_continuity(
                 reference, utc_now(), kraken_reference.ROOT / "source")
             _stage("kraken_reference_complete", reason=reference.get("state"))
-    except errors as exc:
+    except PAPER_ERRORS as exc:
         _stage("kraken_reference_error", reason=type(exc).__name__)
         evidence.setdefault("ema_kraken_reference", {"state": "CHECK_FAILED", "reason": type(exc).__name__})
-    return evidence, baseline
+
+
+def _dispatch_fresh():
+    from lab.paper_run import runtime
+
+    evidence = {}
+    try:
+        _stage("fresh_paper_supervision")
+        evidence["fresh_paper_runner"] = runtime.ensure_runner()
+    except PAPER_ERRORS as exc:
+        _stage("fresh_paper_supervision_error", reason=type(exc).__name__)
+        evidence["fresh_paper_runner"] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+    _supervise_kraken_reference(evidence)
+    return evidence
 
 
 def check(*, deliver=True, mode="operator"):
+    from lab.paper_run.gate import retired
+
     before=time.monotonic()
     cpu=time.process_time()
     _stage("check_lock")
     with writer_lock(ROOT/".check.lock"):
         evidence, baseline = {}, None
-        if mode == "scheduled" and (ROOT.parent / "ema_paper" / "paper.sqlite3").is_file():
-            evidence, baseline = _dispatch_ema()
+        if mode == "scheduled":
+            if retired():
+                evidence = _dispatch_fresh()
+            elif (ROOT.parent / "ema_paper" / "paper.sqlite3").is_file():
+                evidence, baseline = _dispatch_ema()
         return _check_health(evidence, baseline, before=before, cpu=cpu, deliver=deliver, mode=mode)
 
 
@@ -228,6 +253,7 @@ def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
     from lab.health.monitor import collect, finding
     from lab.health import private_telegram
     from lab.ema_paper import private_notifications
+    from lab.paper_run.gate import retired
 
     now=utc_now()
     epoch=int(now.timestamp())
@@ -247,7 +273,32 @@ def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
             private_settings = None
             evidence["ema_private_route"] = "INVALID_LOCAL_CONFIGURATION"
         private_route = private_settings["route_id"] if private_settings else None
-        if "ema_paper" in evidence:
+        fresh = retired()
+        if fresh:
+            _stage("fresh_paper_notification_scan")
+            try:
+                from lab.health import fresh_paper
+                from lab.paper_run import runtime
+
+                view = runtime.status()
+                evidence["fresh_paper"] = {
+                    "generation_id": view.get("generation_id"), "state": view.get("state"),
+                    "books": {slot: {key: book.get(key) for key in ("state", "run_id", "reason", "last_evaluation",
+                                                                  "next_evaluation", "accounting_complete")}
+                              for slot, book in view.get("books", {}).items()},
+                }
+                evidence["fresh_paper_notifications"] = fresh_paper.collect(db, utc_now(), view=view)
+                if private_route and "ema_kraken_reference" in evidence:
+                    reference = evidence["ema_kraken_reference"]
+                    private_notifications.observe(db, utc_now(), {
+                        "collector": reference.get("state") in {"RUNNING", "RUNNING_IDENTITY_UNVERIFIED", "STARTED"},
+                        "staleness": bool(evidence.get("ema_kraken_continuity")),
+                        "watchdog": epoch - int(get_meta(db, "ema_private_watchdog_previous", epoch)) <= WATCHDOG_GRACE_SECONDS,
+                    })
+                    set_meta(db, "ema_private_watchdog_previous", epoch)
+            except PAPER_ERRORS as exc:
+                evidence["fresh_paper_notifications"] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+        if not fresh and "ema_paper" in evidence:
             _stage("ema_notification_scan")
             try:
                 from lab.ema_paper import notifications
@@ -291,7 +342,7 @@ def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
         if mode == "scheduled" and (kraken_root / "paper.sqlite3").is_file():
             _stage("retired_kraken_status")
             evidence.update(_check_kraken_paper(db, cfg, kraken_root))
-        if mode == "scheduled":
+        if mode == "scheduled" and not fresh:
             _stage("evaluation_freshness")
             db.execute("SAVEPOINT evaluation_freshness")
             try:
@@ -376,9 +427,24 @@ def _ema_evaluation_status(books, now):
 
 def _operational_status():
     """Read current component receipts independently of the last full watchdog check."""
+    from lab.paper_run.gate import retired
+
     result = {}
     ema_root = ROOT.parent / "ema_paper"
-    if (ema_root / "paper.sqlite3").is_file():
+    fresh = retired()
+    if fresh:
+        try:
+            from lab.paper_run import runtime
+
+            view = runtime.status()
+            result["paper_evaluation"] = {
+                "generation_id": view.get("generation_id"), "state": view.get("state"),
+                "books": {slot: {key: book.get(key) for key in ("state", "run_id", "reason", "last_evaluation", "next_evaluation")}
+                          for slot, book in view.get("books", {}).items()},
+            }
+        except PAPER_ERRORS:
+            result["paper_evaluation"] = {"state": "EVIDENCE_UNAVAILABLE"}
+    elif (ema_root / "paper.sqlite3").is_file():
         try:
             from lab.ema_paper import catalog, worker
 
@@ -413,7 +479,8 @@ def _operational_status():
                     for category, state, count in db.execute(
                         "SELECT category,status,COUNT(*) FROM outbox "
                         "WHERE category IN ('ideas','paper_entry','paper_no_entry','paper_exit','open_position') "
-                        "GROUP BY category,status ORDER BY category,status")
+                        "AND (?=0 OR id LIKE 'ema-private:fresh:%') GROUP BY category,status ORDER BY category,status",
+                        (int(bool(fresh)),))
                 ]
         except (OSError, sqlite3.Error):
             result["telegram_trade_delivery"] = {"state": "EVIDENCE_UNAVAILABLE"}
@@ -497,7 +564,10 @@ def main():
     elif command == "enable-ema-private-telegram":
         from lab.ema_paper import private_notifications
         from lab.health import private_telegram
+        from lab.paper_run.gate import retired
 
+        if retired():
+            parser.error("The existing private route is retained. This command configures the retired EMA generation.")
         route = private_telegram.destination()
         with writer_lock(ROOT/".check.lock"), connect() as db, db:
             enabled = private_notifications.enable(db, route.identifier, utc_now())
