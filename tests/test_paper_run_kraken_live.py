@@ -172,3 +172,37 @@ def test_single_connection_owner_sends_only_public_btc_trade_subscription():
         assert len(sockets) == 1
     finally:
         feed.close()
+
+
+def test_cumulative_clock_slew_reconnects_without_clearing_replay_watermark():
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def send(self, _):
+            self.frames = iter((acknowledgement(stamp(5), stamp(10)),
+                                update([trade(1, 30)]), update([trade(2, 35)])))
+
+        def recv(self, **_):
+            return next(self.frames)
+
+    # Wall/monotonic divergence grows by 55ms per frame. Only the total
+    # since the acknowledgement exceeds the existing 100ms tolerance.
+    times = ((0, 0), (20, 20), (80, 25), (140, 30), (141, 31))
+    ticks = iter((clock_at(wall)[0], clock_at(mono)[1]) for wall, mono in times)
+    feed = kraken_live.KrakenTradeFeed(connector=lambda *_, **__: Socket(),
+                                      read_clock=lambda: next(ticks), authorize=lambda _: None)
+    with pytest.raises(ValueError, match="LOCAL_CLOCK_STEP"):
+        feed._session(1)
+    assert feed._last_id == 1
+    feed._disconnected("LOCAL_CLOCK_STEP")
+    assert not feed.drain()
+    new_session = acknowledge(feed, ms=150, epoch=2)
+    feed._message(update([trade(1, 180), trade(2, 185)]), clock_at(190), new_session, 2)
+    points = feed.drain()
+    assert [point["event_id"] for point in points] == ["2"]
+    assert points[0]["subscription_epoch"] == 2

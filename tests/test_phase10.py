@@ -17,7 +17,58 @@ from lab.phase10.archive import calendar
 from lab.phase10.evaluation import account_replay
 from lab.phase10.partition import Chunk, PartitionedMarket, checked_funding, partition_features
 from lab.phase10.trading import run_trade
-from lab.storage import file_hash, utc
+from lab.storage import file_hash, utc, writer_lock
+
+
+def test_corrupt_runtime_reports_lock_and_refuses_start(monkeypatch, tmp_path):
+    from lab.learning import state as learner
+    from lab.phase10 import research
+
+    path = tmp_path / "runtime.json"
+    body = b"\0" * 27063
+    path.write_bytes(body)
+    monkeypatch.setattr(worker, "RUNTIME", path)
+    monkeypatch.setattr(worker, "STATE", tmp_path)
+    monkeypatch.setattr(worker, "OUTPUT", tmp_path)
+    monkeypatch.setattr(worker, "LOCK", tmp_path / ".worker.lock")
+    switches = {"paused": False, "monitor": True, "ideas": dict.fromkeys(worker.NAMES, True), "timezone": "UTC"}
+    monkeypatch.setattr(worker, "controls", lambda: switches)
+    monkeypatch.setattr(worker, "set_control", lambda *_: pytest.fail("Corrupt state must not change controls"))
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *_a, **_k: pytest.fail("Corrupt state must not start a process"))
+    monkeypatch.setattr(learner, "status", lambda: {"mode": "OFF"})
+    monkeypatch.setattr(research, "work_state", lambda: {})
+    monkeypatch.setattr(worker, "phase9_controls", lambda: {"training": False})
+    monkeypatch.setattr(worker, "reference", lambda: {"profiles": {}, "ideas": {}})
+    monkeypatch.setattr(worker, "parent_design", lambda: {"design": {"settings": {"profiles": {}}}})
+    with writer_lock(worker.LOCK):
+        view = worker.status()
+        assert view["runtime"] == "CORRUPT_RUNTIME"
+        assert view["last_error"]["writer_lock_held"] is True
+    assert worker.status()["last_error"]["writer_lock_held"] is False
+    with pytest.raises(worker.CorruptRuntime, match="Preserve it"):
+        worker.start_local()
+    with pytest.raises(worker.CorruptRuntime, match="Preserve it"):
+        worker.run(managed=True)
+    assert path.read_bytes() == body
+
+
+def test_runtime_flush_precedes_atomic_replacement(monkeypatch, tmp_path):
+    path = tmp_path / "runtime.json"
+    path.write_bytes(b'{"pid":1}')
+    monkeypatch.setattr(worker, "RUNTIME", path)
+
+    def fail_flush(_):
+        assert path.read_bytes() == b'{"pid":1}'
+        raise OSError("test flush failure")
+
+    with monkeypatch.context() as patches:
+        patches.setattr(worker.os, "fsync", fail_flush)
+        with pytest.raises(OSError, match="test flush failure"):
+            worker.write_runtime({"pid": 2})
+    assert worker.read_runtime() == {"pid": 1}
+    assert not list(tmp_path.glob("*.tmp"))
+    worker.write_runtime({"pid": 2})
+    assert worker.read_runtime() == {"pid": 2}
 
 
 def partition(tmp_path, trade, mark, funding, widths, total_limit=None):

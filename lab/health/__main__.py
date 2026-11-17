@@ -205,9 +205,21 @@ def _supervise_kraken_reference(evidence):
         if synthetic_protocol.active():
             _stage("kraken_reference_supervision")
             from lab.ema_paper import kraken_reference
+            from lab.health import kraken_reference_state
 
             synthetic_protocol.load()
-            reference = kraken_reference.ensure()
+            try:
+                recovery = kraken_reference_state.recover_heartbeat(kraken_reference.ROOT)
+            except kraken_reference_state.RecoveryBlocked as exc:
+                evidence["ema_kraken_reference"] = exc.evidence
+                _stage("kraken_reference_error", reason=exc.evidence["reason"])
+                return
+            if recovery:
+                evidence["ema_kraken_reference_recovery"] = recovery
+                _stage("kraken_reference_heartbeat_preserved", reason=recovery["heartbeat_error"]["error"])
+            # ensure reacquires the dispatch lease and rechecks ownership. The
+            # producer keeps its process lease for the lifetime of the child.
+            reference = kraken_reference.ensure(root=kraken_reference.ROOT)
             evidence["ema_kraken_reference"] = reference
             evidence["ema_kraken_continuity"] = _kraken_reference_continuity(
                 reference, utc_now(), kraken_reference.ROOT / "source")
@@ -459,17 +471,24 @@ def _operational_status():
             result["ema_evaluation"] = {"state": "EVIDENCE_UNAVAILABLE"}
     reference_root = ROOT.parent / "ema_kraken_reference"
     if (reference_root / "reference-heartbeat.json").is_file():
-        try:
-            from lab.ema_paper import kraken_reference
+        from lab.health.kraken_reference_state import heartbeat_problem
 
-            reference = kraken_reference.status(root=reference_root)
-            healthy = _kraken_reference_continuity(reference, utc_now(), reference_root / "source")
-            result["kraken_reference"] = {
-                "state": "HEALTHY" if healthy else "INTERRUPTED",
-                "heartbeat_at": reference.get("heartbeat", {}).get("at"),
-            }
-        except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error):
-            result["kraken_reference"] = {"state": "EVIDENCE_UNAVAILABLE"}
+        if problem := heartbeat_problem(reference_root):
+            result["kraken_reference"] = {"state": "EVIDENCE_UNAVAILABLE", "heartbeat_error": problem}
+        else:
+            try:
+                from lab.ema_paper import kraken_reference
+
+                reference = kraken_reference.status(root=reference_root)
+                healthy = _kraken_reference_continuity(reference, utc_now(), reference_root / "source")
+                result["kraken_reference"] = {
+                    "state": "HEALTHY" if healthy else "INTERRUPTED",
+                    "heartbeat_at": reference.get("heartbeat", {}).get("at"),
+                }
+            except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error):
+                problem = heartbeat_problem(reference_root)
+                result["kraken_reference"] = {"state": "EVIDENCE_UNAVAILABLE",
+                                              **({"heartbeat_error": problem} if problem else {})}
     outbox = ROOT / "watchdog.sqlite3"
     if outbox.is_file():
         try:

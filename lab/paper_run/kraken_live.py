@@ -263,6 +263,7 @@ class KrakenTradeFeed:
             self._state_changed("SUBSCRIBING")
             session = {"request": request}
             previous = request
+            anchor = None
             checked = request[1]
             while not (self._stop.is_set() or self._reconnect.is_set()):
                 try:
@@ -273,10 +274,12 @@ class KrakenTradeFeed:
                         raise TimeoutError("KRAKEN_WEBSOCKET_IDLE")
                 else:
                     now = self._clock()
-                    if _local_step(previous, now):
+                    if _local_step(previous, now) or (anchor is not None and _local_step(anchor, now)):
                         raise ValueError("LOCAL_CLOCK_STEP")
                     previous = now
                     session = self._message(raw, now, session, generation)
+                    if anchor is None and session.get("ack"):
+                        anchor = now
                 if not session.get("ack") and now[1] - request[1] >= ACK_TIMEOUT * 1e9:
                     raise TimeoutError("KRAKEN_SUBSCRIPTION_ACK_TIMEOUT")
                 if now[1] - checked >= PERMISSION_INTERVAL_NS:

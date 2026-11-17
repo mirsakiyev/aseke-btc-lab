@@ -64,4 +64,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except worker.CorruptRuntime as exc:
+        raise SystemExit(str(exc)) from None

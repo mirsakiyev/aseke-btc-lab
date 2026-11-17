@@ -1,4 +1,5 @@
 from datetime import timedelta
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -39,6 +40,45 @@ def optional(path, fallback):
     return read_json(path) if path.exists() else fallback
 
 
+class CorruptRuntime(ValueError):
+    """The persisted worker identity needs an explicit, ownership-checked repair."""
+
+
+def read_runtime():
+    try:
+        row = read_json(RUNTIME)
+    except FileNotFoundError:
+        return {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CorruptRuntime(f"Invalid Phase 10 runtime JSON at {RUNTIME}. Preserve it and verify the worker and observer locks before repair.") from exc
+    if not isinstance(row, dict):
+        raise CorruptRuntime(f"Phase 10 runtime at {RUNTIME} must contain a JSON object.")
+    return row
+
+
+def write_runtime(row):
+    """Flush the replacement's contents before publishing its name."""
+    body = json.dumps(row, indent=2, default=str, allow_nan=False).encode("utf-8")
+    RUNTIME.parent.mkdir(parents=True, exist_ok=True)
+    temporary = RUNTIME.with_name(f".{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(RUNTIME)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def worker_lock_held():
+    try:
+        with writer_lock(LOCK):
+            return False
+    except RuntimeError:
+        return True
+
+
 def controls():
     old = phase9_controls()
     default = {"paused": True, "monitor": old["monitor"], "ideas": old["ideas"],
@@ -66,7 +106,7 @@ def set_control(key, value, profile=None):
 
 
 def process_state():
-    row = optional(RUNTIME, {})
+    row = read_runtime()
     if not row.get("pid"):
         return row, False
     try:
@@ -74,12 +114,7 @@ def process_state():
         live = proc.create_time() == row["created"]
     except (OSError, psutil.Error):
         live = False
-    try:
-        with writer_lock(LOCK):
-            owned = False
-    except RuntimeError:
-        owned = True
-    return row, live and owned
+    return row, live and worker_lock_held()
 
 
 def cadence(config, parent):
@@ -171,7 +206,7 @@ class Worker:
     def save(self):
         self.rt["heartbeat"] = utc_now().isoformat()
         self.rt["raw_bytes"] = self.used
-        write_json(RUNTIME, self.rt)
+        write_runtime(self.rt)
 
     def seed(self, now):
         folder = latest("current")
@@ -489,11 +524,17 @@ def observe_idea(idea, quote, mark, now, policy):
 def status():
     from lab.learning.state import status as learner_status
     from lab.phase10.research import work_state
-    rt, running = process_state()
+    runtime_error = None
+    try:
+        rt, running = process_state()
+    except CorruptRuntime as exc:
+        runtime_error = {"reason": str(exc), "writer_lock_held": worker_lock_held()}
+        rt, running = {}, False
     flags = controls()
     stamp = utc_now()
     heartbeat = rt.get("heartbeat")
-    runtime = "RUNNING" if running and heartbeat and stamp - utc(heartbeat) < pd.Timedelta("2min") else "STALE" if running else "STOPPED"
+    runtime = "CORRUPT_RUNTIME" if runtime_error else (
+        "RUNNING" if running and heartbeat and stamp - utc(heartbeat) < pd.Timedelta("2min") else "STALE" if running else "STOPPED")
     legacy = learner_status()
     probe = optional(OUTPUT / "binance-probe" / "result.json", {})
     cfg, parent = reference(), parent_design()
@@ -507,6 +548,8 @@ def status():
             reason = "MONITORING_OFF"
         elif not flags["ideas"][name]:
             reason = "IDEAS_OFF"
+        elif runtime_error:
+            reason = "CORRUPT_RUNTIME"
         elif runtime == "STOPPED":
             reason = "WORKER_STOPPED"
         elif reason == "MONITORING_OFF":
@@ -523,7 +566,7 @@ def status():
         counts[value] += 1
     return {"execution_mode": MODE, "validation": APPROVAL, "runtime": runtime, "controls": flags,
             "identity": {key: rt.get(key) for key in ("pid", "created", "launcher", "launch_id", "started_at", "heartbeat")},
-            "last_error": rt.get("last_error"), "retry_at": rt.get("retry_at"), "raw_bytes": rt.get("raw_bytes", 0),
+            "last_error": runtime_error or rt.get("last_error"), "retry_at": rt.get("retry_at"), "raw_bytes": rt.get("raw_bytes", 0),
             "raw_ceiling_bytes": MAX_RAW_BYTES, "profiles": view, "decision_counts": counts,
             "research": {**work_state(), "reason": probe.get("reason", "Finite source probe pending"),
                          "legacy_mode": legacy["mode"], "phase9_manual_gate": phase9_controls()["training"]}}
@@ -542,7 +585,11 @@ def run(managed=False):
                 if controls()["paused"]:
                     return
                 now = utc_now()
-                rt = optional(RUNTIME, {})
+                try:
+                    rt = read_runtime()
+                except CorruptRuntime as exc:
+                    LOG.error("KuCoin worker start blocked: %s", exc)
+                    raise
                 previous = rt.get("launch_id")
                 rt.update(pid=os.getpid(), created=psutil.Process().create_time(), launcher="scheduled" if managed else "local",
                           launch_id=uuid4().hex, started_at=now.isoformat(), previous_launch=previous, stopped_at=None,
@@ -613,10 +660,11 @@ def start_local():
 
 
 def _drain(seconds):
+    read_runtime()
     set_control("paused", True)
     deadline = time.monotonic() + seconds
     while True:
-        rt = optional(RUNTIME, {})
+        rt = read_runtime()
         worker_owned = True
         observer_owned = None
         try:

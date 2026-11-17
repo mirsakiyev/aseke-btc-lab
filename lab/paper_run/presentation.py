@@ -107,7 +107,8 @@ def _detail(book):
         "net_closed": book.get("closed_net") if book.get("accounting_complete", True) else None,
         "fees": book.get("fees"), "funding": book.get("funding"), "financing": book.get("financing"),
         "liquidation_cost": book.get("liquidation_cost"), "unfunded_deficit": book.get("unfunded_deficit"),
-        "last_evaluation": book.get("last_evaluation"), "next_evaluation": book.get("next_evaluation"),
+        "last_evaluation": book.get("last_evaluation"), "last_completed_evaluation": book.get("last_completed_evaluation"),
+        "next_evaluation": book.get("next_evaluation"),
         "last_accepted_price_observation": book.get("last_observation"), "position": book.get("position"),
     }, expanded=False)
     history = book.get("recent_closed") or []

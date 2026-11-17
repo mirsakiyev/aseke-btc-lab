@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from lab.learning.simulator import Position
+from lab.ema_paper.catalog import SOURCE_POLICY
 from lab.paper_run import ema, execution
 from lab.phase15 import catalog, paper
 from lab.strategy_lab.market_data import MarketData, Observation, Purpose
@@ -21,7 +22,7 @@ def successor(profile):
     original = lane(profile)
     mode = ema.CASH_MODE if profile == "position" else ema.LEVERAGED_MODE
     return {**original, "risk": {**original["risk"], "leverage": 1 if profile == "position" else 3},
-            "source_policy": original["source"], "source": ema.SOURCE, "symbol": ema.SYMBOL,
+            "source_policy": {**SOURCE_POLICY, **original["source"]}, "source": ema.SOURCE, "symbol": ema.SYMBOL,
             "execution_mode": mode, "entry_model": mode, "exit_model": mode, "price_basis": ema.SOURCE,
             "long_only": profile == "position"}
 

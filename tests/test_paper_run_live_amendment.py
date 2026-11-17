@@ -145,6 +145,65 @@ def test_daily_chart_boundary_must_also_follow_amendment_effective_time(generati
         assert book["last_evaluation"]["boundary"] == stamp(EFFECTIVE.ceil("1D"))
 
 
+def test_expired_ema_retries_do_not_replace_readiness_or_last_completed_decision(generation, monkeypatch):
+    record, now = generation
+    amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
+    lane = source_amendment.lanes(record, amendment)[DAY]
+    boundary = EFFECTIVE.ceil(lane["timeframe"])
+    step = pd.Timedelta(lane["timeframe"])
+    grace = pd.Timedelta(seconds=lane["source_policy"]["publication_max_seconds"])
+    calls = []
+
+    def confirm(_, __, ___, at, *, db):
+        calls.append(at)
+        if at.floor(step) == boundary + step:
+            return {"state": "EVALUATED", "signal": {"decision": "NO_TRADE"}}
+        return {"state": "WAITING", "reason": "Chart receipt still missing"}
+
+    monkeypatch.setattr(ema, "confirmation", confirm)
+    with closing(runtime.connect()) as db, db:
+        book = paper.load(db, lane)
+        books = {DAY: book}
+        now[0] = boundary + pd.Timedelta(seconds=1)
+        runtime.evaluate(db, record, books, {DAY: lane}, now[0], {})
+        waiting = deepcopy(book["last_evaluation"])
+        for delay in (pd.Timedelta(seconds=1), pd.Timedelta(minutes=1)):
+            now[0] = boundary + grace + delay
+            runtime.evaluate(db, record, books, {DAY: lane}, now[0], {})
+            assert book["last_evaluation"] == waiting
+        assert len(calls) == 1
+
+        now[0] = boundary + step + pd.Timedelta(seconds=1)
+        runtime.evaluate(db, record, books, {DAY: lane}, now[0], {})
+        completed = deepcopy(book["last_evaluation"])
+        assert completed["state"] == "EVALUATED"
+        now[0] = boundary + 2 * step + pd.Timedelta(seconds=1)
+        runtime.evaluate(db, record, books, {DAY: lane}, now[0], {})
+        assert book["last_evaluation"]["state"] == "WAITING"
+        assert book["last_completed_evaluation"] == completed
+
+
+def test_ema_read_finishing_after_frozen_window_cannot_publish_or_overwrite(generation, monkeypatch):
+    record, now = generation
+    amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
+    lane = source_amendment.lanes(record, amendment)[DAY]
+    boundary = EFFECTIVE.ceil(lane["timeframe"])
+    deadline = boundary + pd.Timedelta(seconds=lane["source_policy"]["publication_max_seconds"])
+    now[0] = deadline - pd.Timedelta(seconds=1)
+
+    def slow_confirmation(*_args, **_kwargs):
+        now[0] = deadline + pd.Timedelta(milliseconds=1)
+        return {"state": "EVALUATED", "analysis": {"plan": {"eligible_from": deadline + pd.Timedelta(minutes=1)}}}
+
+    monkeypatch.setattr(ema, "confirmation", slow_confirmation)
+    monkeypatch.setattr(paper, "publish", lambda *_: pytest.fail("Expired boundary must not publish"))
+    with closing(runtime.connect()) as db, db:
+        book = paper.load(db, lane)
+        runtime.evaluate(db, record, {DAY: book}, {DAY: lane}, now[0], {})
+        assert "last_evaluation" not in book
+        assert not book["pending"]
+
+
 def test_live_consumer_prices_long_short_exactly_and_rejects_position_short(generation):
     record, now = generation
     amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
@@ -240,3 +299,41 @@ def test_equal_exchange_times_accept_increasing_trade_id_and_protect_across_reco
     assert saved_book(lane)["problem"] == "UNRESOLVED_PROTECTION_INTERVAL"
     with closing(runtime.connect(readonly=True)) as db:
         assert runtime._source_state(db, ema.SOURCE)["last_observation"]["event_id"] == "93"
+
+
+def test_clock_degradation_expires_pending_without_bypassing_open_position_protection(generation, monkeypatch):
+    record, now = generation
+    amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
+    lanes = source_amendment.lanes(record, amendment)
+    day, swing = lanes[DAY], lanes[SWING]
+    intent(day, amendment)
+    runtime.live_prices(record, amendment, [live_point(91)], {})
+    assert saved_book(day)["position"]
+    expiry = TICK + pd.Timedelta(seconds=60)
+    intent(swing, amendment, expiry=expiry)
+
+    monkeypatch.setattr(runtime, "synchronized", lambda _: False)
+    stop_at = TICK + pd.Timedelta(seconds=46)
+    now[0] = stop_at + pd.Timedelta(milliseconds=125)
+    runtime.live_prices(record, amendment, [live_point(92, price="94.876500", at=stop_at)], {})
+    assert saved_book(day)["position"]["unresolved_protection"]
+    assert not history(day, "EXIT_OBSERVED")
+    gap, = history(day, "PROTECTION_GAP")
+    assert gap["reason"] == "WORKSTATION_CLOCK_SYNC_UNVERIFIED"
+    assert saved_book(swing)["pending"] and not history(swing, "HYPOTHETICAL_FILL")
+
+    monkeypatch.setattr(runtime.protocol, "current_metadata", lambda: {})
+    monkeypatch.setattr(runtime, "evaluate", lambda *_: None)
+    now[0] = expiry
+    runtime.cycle()
+    assert history(swing, "EXPIRED")
+    assert not saved_book(swing)["pending"] and saved_book(swing)["cash"] == 10_000.
+    assert saved_book(day)["position"]
+
+    monkeypatch.setattr(runtime, "synchronized", lambda _: True)
+    recovered_at = expiry + pd.Timedelta(seconds=2)
+    now[0] = recovered_at + pd.Timedelta(milliseconds=125)
+    runtime.live_prices(record, amendment, [live_point(93, price="94.876500", at=recovered_at, epoch=2)], {})
+    closed, = history(day, "CLOSED")
+    assert closed["source_event_id"] == "93" and closed["reason"] == "stop"
+    assert closed["provisional"] and not saved_book(day)["position"]

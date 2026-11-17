@@ -371,12 +371,15 @@ def evaluate(db, record, books, candidates, now, metadata):
         if prior.get("boundary") == boundary.isoformat() and (
                 prior["state"] == "EVALUATED" or now - utc(prior["at"]) < pd.Timedelta(seconds=15)):
             continue
-        if lane["family"] == "BREAKOUT" and now > boundary + pd.Timedelta(seconds=body["max_live_delay_seconds"]):
+        seconds = (body["max_live_delay_seconds"] if lane["family"] == "BREAKOUT"
+                   else lane["source_policy"]["publication_max_seconds"])
+        deadline = boundary + pd.Timedelta(seconds=seconds)
+        if now > deadline:
             continue
-        eligible[slot] = (lane, boundary)
-    breakouts = {slot: lane for slot, (lane, _) in eligible.items() if lane["family"] == "BREAKOUT"}
+        eligible[slot] = (lane, boundary, deadline)
+    breakouts = {slot: lane for slot, (lane, _, _) in eligible.items() if lane["family"] == "BREAKOUT"}
     rows = breakout.confirmation_rows(record, breakouts, books, now) if breakouts else {}
-    for slot, (lane, boundary) in eligible.items():
+    for slot, (lane, boundary, deadline) in eligible.items():
         book = books[slot]
         row = rows.get(slot)
         if row is not None:
@@ -392,9 +395,18 @@ def evaluate(db, record, books, candidates, now, metadata):
                 LOG.exception("EMA evaluation failed for %s", slot)
                 assessment = {"state": "WAITING", "reason": f"EMA chart evaluation failed ({type(exc).__name__})"}
         actual = utc_now()
-        book["last_evaluation"] = {"at": actual.isoformat(), "boundary": boundary.isoformat(),
-                                   "state": assessment["state"], "reason": assessment.get("reason"),
-                                   "signal": assessment.get("signal")}
+        if lane["family"] == "EMA":
+            if actual > deadline:
+                continue
+            previous = book.get("last_evaluation") or {}
+            if previous.get("state") == "EVALUATED":
+                book["last_completed_evaluation"] = previous
+        evaluation = {"at": actual.isoformat(), "boundary": boundary.isoformat(),
+                      "state": assessment["state"], "reason": assessment.get("reason"),
+                      "signal": assessment.get("signal")}
+        book["last_evaluation"] = evaluation
+        if lane["family"] == "EMA" and evaluation["state"] == "EVALUATED":
+            book["last_completed_evaluation"] = evaluation
         analysis = assessment.get("analysis")
         if analysis and analysis.get("plan") and _can_enter(lane, body, actual):
             plan = analysis["plan"]
@@ -600,6 +612,8 @@ def status():
                 elif not incomplete and stream.get("state") != "STREAMING":
                     state = "BLOCKED" if stream.get("state") == "BLOCKED" else "WAITING"
                     reason = stream.get("reason") or "Awaiting the Kraken trade subscription"
+                elif state == "ACTIVE" and not synchronized(now):
+                    state, reason = "BLOCKED", "WORKSTATION_CLOCK_SYNC_UNVERIFIED"
                 if stream.get("last_usable_observation"):
                     source["last_observation"] = stream["last_usable_observation"]
             if incomplete:
@@ -673,8 +687,9 @@ def ensure_runner():
             pass
     except RuntimeError:
         amendment = source_amendment.active(record)
-        outcome = runner_reload.if_needed(gate.ROOT, record["id"], amendment["id"], project=PROJECT,
-                                          expected_build=RUNNER_BUILD) if amendment else None
+        # Source amendments require a controlled handoff. A code edit alone
+        # must not interrupt a running owner or its position monitoring.
+        outcome = runner_reload.if_needed(gate.ROOT, record["id"], amendment["id"], project=PROJECT) if amendment else None
         if not outcome or outcome["state"] != "RUNNER_RELOADED":
             return outcome or {"state": "RUNNER_LOCKED"}
     with writer_lock(gate.ROOT / ".launch.lock"):
