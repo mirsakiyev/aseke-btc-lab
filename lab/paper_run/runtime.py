@@ -25,6 +25,7 @@ from lab.phase13.registry import sealed
 from lab.phase15 import catalog, paper
 from lab.paper_run import archive, breakout, ema, execution, gate, kraken_live, source_amendment, sources
 from lab.paper_run import reload as runner_reload
+from lab.paper_run import protection_incidents as incidents, protection_reporting
 from lab.storage import file_hash, read_json, utc, utc_now, write_json, writer_lock
 
 
@@ -44,7 +45,9 @@ CREATE INDEX IF NOT EXISTS observation_at ON observation(source,at);
 ERRORS = (OSError, ValueError, KeyError, TypeError, StopIteration, sqlite3.Error)
 LOG = logging.getLogger(__name__)
 RUNNER_BUILD = fingerprint([file_hash(Path(__file__).with_name(name)) for name in (
-    "runtime.py", "ema.py", "execution.py", "kraken_live.py", "source_amendment.py")])
+    "runtime.py", "ema.py", "execution.py", "kraken_live.py", "source_amendment.py",
+    "protection_incidents.py", "protection_commands.py", "protection_evidence.py", "protection_reporting.py",
+    "operator_close.py")])
 
 
 def current():
@@ -70,6 +73,12 @@ def connect(*, readonly=False):
     db.executescript(SQL)
     ema.init(db)
     return db
+
+
+def _load_book(db, lane):
+    book = paper.load(db, lane)
+    incidents.restore_admission(db, book)
+    return book
 
 
 def definitions(archive_record, qualifications, now):
@@ -365,7 +374,9 @@ def evaluate(db, record, books, candidates, now, metadata):
         grace = int(body["config"]["ideas"]["completed_candle_grace_seconds"]) if lane["family"] == "BREAKOUT" else 0
         boundary = (now - pd.Timedelta(seconds=grace)).floor(lane["timeframe"])
         source_start = utc(lane.get("source_effective_at", body["start"]))
-        if boundary < max(utc(body["start"]), source_start) or any((book["position"], book["pending"], book["problem"])):
+        resume = (book.get("prospective_admission") or {}).get("effective_at")
+        first = max(utc(body["start"]), source_start, utc(resume) if resume else source_start)
+        if boundary < first or book["position"] or book["pending"] or not incidents.admission_allowed(book, now):
             continue
         prior = book.get("last_evaluation") or {}
         if prior.get("boundary") == boundary.isoformat() and (
@@ -390,7 +401,9 @@ def evaluate(db, record, books, candidates, now, metadata):
                           "analysis": {**row, "plan": plan}}
         else:
             try:
-                assessment = ema.confirmation(lane, book, body, now, db=db)
+                assessment_book = {**book, "problem": None} if (
+                    book.get("problem") and incidents.admission_allowed(book, now)) else book
+                assessment = ema.confirmation(lane, assessment_book, body, now, db=db)
             except ERRORS as exc:
                 LOG.exception("EMA evaluation failed for %s", slot)
                 assessment = {"state": "WAITING", "reason": f"EMA chart evaluation failed ({type(exc).__name__})"}
@@ -413,7 +426,12 @@ def evaluate(db, record, books, candidates, now, metadata):
             if lane.get("source_amendment_id"):
                 plan.update(source_amendment_id=lane["source_amendment_id"], observation_kind=lane["observation_kind"])
             if actual < utc(plan["eligible_from"]) < min(utc(plan["entry_expiry"]), utc(lane["publication_end_exclusive"])):
-                paper.publish(db, book, analysis, actual)
+                if book.get("problem") and incidents.admission_allowed(book, actual):
+                    prospective = {**book, "problem": None}
+                    paper.publish(db, prospective, analysis, actual)
+                    book.update(pending=prospective["pending"], cursor=prospective["cursor"])
+                else:
+                    paper.publish(db, book, analysis, actual)
         paper.save(db, book)
 
 
@@ -425,7 +443,7 @@ def cycle():
     amendment = source_amendment.active(record)
     lanes = source_amendment.lanes(record, amendment)
     with writer_lock(gate.ROOT / ".writer.lock"), closing(connect()) as db:
-        books = {slot: paper.load(db, lane) for slot, lane in lanes.items()}
+        books = {slot: _load_book(db, lane) for slot, lane in lanes.items()}
         try:
             metadata = protocol.current_metadata()
         except ERRORS:
@@ -486,9 +504,11 @@ def cycle():
                 paper.save(db, book)
                 db.commit()
         evaluate(db, record, books, candidates, utc_now(), metadata)
+        policy = incidents.active(db)
         db.commit()
     result = {"state": "RUNNING", "at": utc_now().isoformat(), "generation": record["id"], "pid": os.getpid(),
               "runner_build_id": RUNNER_BUILD,
+              "protection_policy": policy["policy"] if policy else None,
               "source_amendment_id": amendment["id"] if amendment else None,
               "ema_live_needed": bool(amendment) and any(books[slot]["position"] or books[slot]["pending"]
                                                         for slot in source_amendment.SLOTS)}
@@ -522,7 +542,7 @@ def _apply_live_point(db, book, lane, body, obs):
             reason = "ENTRY_WINDOW_ELAPSED"
         if reason:
             db.rollback()
-            restored = paper.load(db, lane)
+            restored = _load_book(db, lane)
             book.clear()
             book.update(restored)
             if book["pending"] and execution.pending_ready(db, book, at):
@@ -536,16 +556,34 @@ def _apply_live_point(db, book, lane, body, obs):
         raise
 
 
-def live_prices(record, amendment, points, diagnostics, *, detect_gap=False):
+def live_prices(record, amendment, points, diagnostics, *, detect_gap=False, witnesses=()):
     """One price consumer for three EMA slots. The subscription never writes to SQLite."""
     body = record["body"]
     lanes = source_amendment.lanes(record, amendment)
     ema_lanes = {slot: lanes[slot] for slot in source_amendment.SLOTS}
     with writer_lock(gate.ROOT / ".writer.lock"), closing(connect()) as db:
-        books = {slot: paper.load(db, lane) for slot, lane in ema_lanes.items()}
+        books = {slot: _load_book(db, lane) for slot, lane in ema_lanes.items()}
         state = _source_state(db, ema.SOURCE)
         now = utc_now()
-        if detect_gap:
+        policy = incidents.active(db)
+        if policy:
+            journal_book = books["ema/day"]
+            for witness in witnesses:
+                incidents.append(db, journal_book, "PROTECTION_TRANSPORT_WITNESS", "TRANSPORT", now,
+                                 {"generation": record["id"], "witness": witness}, identity=witness["id"])
+                if witness["kind"] in ("DISCONNECTED", "QUEUE_DROPPED", "WITNESS_OVERFLOW"):
+                    for book in books.values():
+                        position = book.get("position")
+                        if position and utc(witness["at"]) >= utc(position["entry_at"]):
+                            incidents.open_incident(db, book, now, witness.get("reason", witness["kind"]),
+                                                    diagnostics=witness, witness_id=witness["id"])
+                            paper.save(db, book)
+            if detect_gap and not any(item["kind"] in ("DISCONNECTED", "QUEUE_DROPPED", "WITNESS_OVERFLOW") for item in witnesses):
+                for book in books.values():
+                    incidents.open_incident(db, book, now, "KRAKEN_STREAM_DISCONTINUITY", diagnostics=diagnostics)
+                    paper.save(db, book)
+            db.commit()
+        elif detect_gap:
             for book in books.values():
                 if record_pos := book["position"]:
                     record_pos["unresolved_protection"] = True
@@ -579,6 +617,7 @@ def live_prices(record, amendment, points, diagnostics, *, detect_gap=False):
             for slot, book in books.items():
                 if book["position"] or book["pending"]:
                     _apply_live_point(db, book, ema_lanes[slot], body, obs)
+        return [item["id"] for item in witnesses] if policy else []
 
 
 def status():
@@ -597,11 +636,24 @@ def status():
         db.execute("BEGIN")
         for slot, lane in lanes.items():
             info = paper.book_report(db, lane)
+            incidents.restore_admission(db, info)
+            research = protection_reporting.summarize(db, lane, info)
+            info.update(research)
+            for field in ("closed_net", "expectancy", "expectancy_r", "closed_fees", "closed_funding",
+                          "top_three_share_of_positive_gains", "average_hold_minutes"):
+                info[field] = research["validated_" + field]
             qualification = lane["qualification"]
             source = _source_state(db, lane["source"])
-            reason = qualification.get("reason") or source.get("reason") or info["problem"]
+            admitted = incidents.admission_allowed(info, now)
+            operational_problem = info["problem"] if not admitted else None
+            reason = qualification.get("reason") or source.get("reason") or operational_problem
             position = info["position"] or {}
-            incomplete = position.get("unresolved_costs") or position.get("unresolved_protection") or info["problem"]
+            incomplete = position.get("unresolved_costs") or position.get("unresolved_protection") or operational_problem
+            info.update(historical_problem=info["problem"],
+                        prospective_entry_permission=admitted and not bool(position.get("unresolved_protection")),
+                        financial_reconciliation_complete=abs(info["cash_reconciliation_difference"]) <= 1e-8
+                        and not bool(position.get("unresolved_costs")),
+                        protection_incidents=incidents.project(db, lane["book_id"]))
             state = "BLOCKED" if qualification["state"] != "QUALIFIED" or incomplete or source.get("restricted") else (
                 "ACTIVE" if live and _can_enter(lane, body, now) else "WAITING")
             if not live and not reason:
@@ -666,10 +718,13 @@ def run():
                     lane = {"source": ema.SOURCE, "symbol": ema.SYMBOL, "observation_kind": execution.WS_TRADE}
                     if points and not execution.valid_snapshot(points[-1], lane, *execution.clock()):
                         last_usable = points[-1]
-                    if result.get("ema_live_needed") and (points or has_gap or now >= next_gap_check):
+                    witnesses = feed.pending_witnesses() if result.get("protection_policy") else []
+                    if witnesses or (result.get("ema_live_needed") and (points or has_gap or now >= next_gap_check)):
                         next_gap_check = now + POLL_SECONDS
                         try:
-                            live_prices(record, amendment, points, diagnostics, detect_gap=has_gap)
+                            accepted = live_prices(record, amendment, points, diagnostics, detect_gap=has_gap,
+                                                   witnesses=witnesses)
+                            feed.acknowledge_witnesses(accepted)
                         except (RuntimeError, *ERRORS):
                             LOG.exception("Kraken paper reference processing failed")
                 time.sleep(.1 if feed else min(1., max(0., next_cycle - time.monotonic())))

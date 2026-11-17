@@ -30,16 +30,8 @@ def current_view(*, family=None):
     view = runtime.status()
     books = {slot: dict(book) for slot, book in view.get("books", {}).items()
              if family is None or slot.startswith(f"{family}/")}
-    if books and view.get("generation_id"):
-        with closing(runtime.connect(readonly=True)) as db:
-            db.execute("BEGIN")
-            for book in books.values():
-                count, wins = db.execute(
-                    "SELECT count(*),count(CASE WHEN json_extract(body,'$.net')>0 THEN 1 END) FROM event "
-                    "WHERE book=? AND kind='CLOSED' AND json_extract(body,'$.net') IS NOT NULL",
-                    (book["book_id"],),
-                ).fetchone()
-                book["win_rate"] = wins / count if count and book.get("accounting_complete", True) else None
+    for book in books.values():
+        book["win_rate"] = book.get("validated_win_rate")
     return {**view, "books": books, "archive": view.get("archive") or marker["body"]["path"],
             "cutoff": view.get("cutoff") or marker["body"]["cutoff"], "retirement_id": marker["id"],
             "mode": MODE, "approval": APPROVAL, "comparisons": []}
@@ -72,7 +64,7 @@ def _stamp(value):
 
 
 def _summary(book):
-    okay = book.get("accounting_complete", True)
+    okay = book.get("financial_reconciliation_complete", book.get("accounting_complete", True))
     observation = book.get("last_observation")
     reference = (observation.get("price_text", observation.get("reference_price_text", observation.get("price", observation.get("mark"))))
                  if isinstance(observation, dict) else None)
@@ -81,8 +73,9 @@ def _summary(book):
         "Price basis": PRICE_BASES.get(book["price_basis"], book["price_basis"]),
         "Freshness budget (s)": book["freshness_seconds"], "Balance": _money(book.get("cash")),
         "Equity": _money(book.get("equity") if okay else None), "Exposure": _money(book.get("exposure")),
-        "Realized net": _money(book.get("closed_net") if okay else None),
-        "Closed trades": (book.get("counts") or {}).get("CLOSED", 0),
+        "Validated realized net": _money(book.get("closed_net") if okay else None),
+        "Validated closed trades": book.get("validated_closed_count", 0),
+        "Excluded closed trades": book.get("excluded_closed_count", 0),
         "Win rate": f"{book['win_rate']:.1%}" if book.get("win_rate") is not None else "—",
         "Last evaluation": _stamp(book.get("last_evaluation")), "Next evaluation": _stamp(book.get("next_evaluation")),
         "Latest accepted price": str(reference) if reference is not None else None,
@@ -98,26 +91,39 @@ def _detail(book):
     st.caption(f"{book['entry_model']} entry · {book['exit_model']} exit")
     if reason := book.get("reason") or book.get("problem"):
         st.warning(str(reason))
-    if not book.get("accounting_complete", True):
-        st.warning("Accounting is unresolved. Final performance is unavailable.")
+    financial = book.get("financial_reconciliation_complete", book.get("accounting_complete", True))
+    if not financial:
+        st.warning("Financial reconciliation is unresolved.")
+    if book.get("research_state") == "QUARANTINED":
+        st.warning("Affected outcomes and dependent capital are excluded from validated performance.")
     st.json({
         "run_id": book["run_id"], "book_id": book["book_id"], "retired_book_id": book.get("retired_book_id"),
         "account_unit": book.get("ledger_unit", "USDT").replace("NOMINAL_USDT", "nominal USDT"),
         "starting_balance": book.get("starting_equity"), "balance": book.get("cash"), "open_exposure": book.get("exposure"),
-        "net_closed": book.get("closed_net") if book.get("accounting_complete", True) else None,
+        "validated_net_closed": book.get("closed_net") if financial else None,
         "fees": book.get("fees"), "funding": book.get("funding"), "financing": book.get("financing"),
         "liquidation_cost": book.get("liquidation_cost"), "unfunded_deficit": book.get("unfunded_deficit"),
         "last_evaluation": book.get("last_evaluation"), "last_completed_evaluation": book.get("last_completed_evaluation"),
         "next_evaluation": book.get("next_evaluation"),
         "last_accepted_price_observation": book.get("last_observation"), "position": book.get("position"),
+        "current_protection_incidents": book.get("protection_incidents"),
+        "historical_problem": book.get("historical_problem"),
+        "prospective_entry_permission": book.get("prospective_entry_permission"),
+        "financial_reconciliation_complete": book.get("financial_reconciliation_complete"),
+        "research_validation": book.get("research_state"),
+        "nominal_closed_net": book.get("nominal_closed_net"),
+        "validated_closed_net": book.get("validated_closed_net"),
+        "capital_dependency": book.get("capital_dependency"),
     }, expanded=False)
     history = book.get("recent_closed") or []
     st.subheader("Current run trade history")
     if history:
-        complete = book.get("accounting_complete", True)
+        complete = financial
+        excluded = {item["position_id"] for item in book.get("outcomes", []) if item["validation_state"] == "EXCLUDED"}
         st.dataframe([{"Entry": _stamp(row.get("entry_at")), "Exit": _stamp(row.get("exit_at")),
                        "Reason": row.get("reason"), "Entry price": row.get("entry_price"), "Exit price": row.get("exit_price"),
-                       "Net": row.get("net") if complete and not row.get("provisional") else None}
+                       "Net": row.get("net") if complete and not row.get("provisional")
+                       and row.get("idea_id") not in excluded else None}
                       for row in history], hide_index=True, width="stretch")
     else:
         st.caption("No completed paper trades.")

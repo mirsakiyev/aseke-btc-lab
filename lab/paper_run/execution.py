@@ -9,6 +9,7 @@ import pandas as pd
 
 from lab.learning.simulator import Contract, Cost, Position, liquidation_price, triggers
 from lab.phase15 import paper
+from lab.paper_run import protection_incidents as incidents
 from lab.storage import utc, utc_now
 
 
@@ -117,7 +118,8 @@ def pending_ready(db, book, now):
     if now >= utc(idea["plan"]["entry_expiry"]):
         finish(db, book, now, "EXPIRED", idea.get("last_rejection", "NO_QUALIFYING_FORWARD_REFERENCE"))
         return False
-    return (not book["position"] and not book["problem"] and utc(idea["plan"]["eligible_from"]) <= now)
+    return (not book["position"] and incidents.admission_allowed(book, now)
+            and utc(idea["plan"]["eligible_from"]) <= now)
 
 
 def reject(db, book, now, reason):
@@ -174,11 +176,16 @@ def entry(db, book, lane, obs, terms_at_price, *, read_clock=clock):
               "deadline": deadline.isoformat(), "signal_boundary": idea["boundary"],
               "confirmed_at": idea["published_at"], "eligible_from": earliest.isoformat(),
               "source_amendment_id": lane.get("source_amendment_id")}
+    provenance = incidents.dependency(book)
+    if provenance:
+        detail["research_provenance"] = provenance
     position = {**idea, "entry_at": entry_at, "raw_entry": price, "entry_fee": fee, "entry_cash": book["cash"],
                 "stop": stop, "target": terms["target"], "deadline": deadline.isoformat(), "last_trail": None,
                 "planned_risk": terms["planned_risk"], "position": asdict(pos), "last_mark": price,
                 "mark_source_at": obs["source_at"], "mark_received_at": obs["received_at"],
                 "mark_event_id": obs["event_id"], "entry_evidence": detail}
+    if provenance:
+        position["research_provenance"] = provenance
     paper.event(db, book, "HYPOTHETICAL_FILL", idea["id"], committed, committed, detail)
     book.update(position=position, pending=None, cursor=None, fees=book["fees"] + fee, turnover=book["turnover"] + notional)
     paper.mark_account(book, pos, price)
@@ -188,6 +195,9 @@ def missing_protection(db, book, at, reason):
     record = book["position"]
     start = record.get("mark_received_at", record["entry_at"])
     if at - utc(start) <= PROTECTION_GAP or record.get("exit_observed"):
+        return
+    if incidents.active(db):
+        incidents.open_incident(db, book, at, reason)
         return
     gap = record.get("protection_gap")
     if not gap or gap.get("ended_at"):
@@ -232,6 +242,8 @@ def close(db, book, lane, now):
                "fees": pos.fees, "funding": pos.funding, "liquidation_cost": pos.liquidation_cost,
                "unfunded_deficit": pos.unfunded_deficit, "turnover": pos.turnover, "provisional": provisional,
                "holding_minutes": (utc(result["exit_at"]) - utc(record["entry_at"])).total_seconds() / 60}
+    if record.get("research_provenance"):
+        payload["research_provenance"] = record["research_provenance"]
     paper.event(db, book, "CLOSED", record["id"], utc(result["exit_at"]), now, payload)
     book["gross"] += pos.realized
     book["raw_gross"] += pos.realized
@@ -278,7 +290,9 @@ def protect(db, book, lane, obs, *, unresolved_costs=False, read_clock=clock):
     if committed < decision or (reason := valid_snapshot(obs, lane, committed, mono)):
         return missing_protection(db, book, max(decision, committed), reason or "LOCAL_CLOCK_STEP")
     missing_protection(db, book, committed, "ELAPSED_WITHOUT_QUALIFYING_REFERENCE")
-    if gap := record.get("protection_gap"):
+    if incidents.active(db):
+        incidents.recovered(db, book, obs, committed, mono)
+    elif gap := record.get("protection_gap"):
         if not gap.get("ended_at"):
             gap["ended_at"] = committed.isoformat()
             paper.event(db, book, "PROTECTION_RESUMED", record["id"], committed, committed, gap)

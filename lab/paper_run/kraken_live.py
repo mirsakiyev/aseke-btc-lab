@@ -2,13 +2,17 @@
 
 from collections import Counter, deque
 from contextlib import closing
+from copy import deepcopy
 from decimal import Decimal
 from hashlib import sha256
 import json
 from math import ceil, isfinite
 from statistics import median
+import re
 from threading import Event, Lock, Thread
 import time
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 import pandas as pd
 import psutil
@@ -32,6 +36,40 @@ ACK_TIMEOUT = 5.
 IDLE_TIMEOUT = 10.
 QUEUE_LIMIT = 256
 MAX_MESSAGE_BYTES = 32 * 1024
+WITNESS_LIMIT = 128
+WITNESS_SCHEMA = "KRAKEN_TRANSPORT_WITNESS_V1"
+
+
+def _safe_detail(value):
+    text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).split())[:1024]
+
+    def redact_url(match):
+        try:
+            parts = urlsplit(match[0])
+        except ValueError:
+            return "[redacted URL]"
+        return f"{parts.scheme}://{parts.hostname or '[redacted]'}{parts.path}"
+
+    text = re.sub(r"(?:https?|wss?)://[^\s]+", redact_url, text)
+    text = re.sub(r"(?i)authorization\s*[:=]\s*(?:Bearer\s+)?\S+", "authorization=[redacted]", text)
+    text = re.sub(r"(?i)(authorization|api[_-]?key|token|secret|password)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    return text[:240]
+
+
+def _exception_details(error):
+    if error is None:
+        return None
+    result = {"type": type(error).__name__, "message": _safe_detail(error)}
+    for name in ("rcvd", "sent"):
+        frame = getattr(error, name, None)
+        if frame is not None:
+            code = getattr(frame, "code", None)
+            result[name] = {"code": int(code) if isinstance(code, int) else None,
+                            "reason": _safe_detail(getattr(frame, "reason", ""))}
+    cause = error.__cause__
+    if cause is not None:
+        result["cause"] = {"type": type(cause).__name__, "message": _safe_detail(cause)}
+    return result
 
 
 def permission(at):
@@ -102,6 +140,12 @@ class KrakenTradeFeed:
         self._high_water = 0
         self._last_id = 0
         self._last_source = None
+        self._last_point = None
+        self._feed_instance = uuid4().hex
+        self._witness_sequence = 0
+        self._witnesses = deque()
+        self._witness_overflow = None
+        self._awaiting_recovery = False
 
     def start(self):
         with self._lock:
@@ -127,11 +171,45 @@ class KrakenTradeFeed:
             self._queue.clear()
         return points
 
+    def pending_witnesses(self):
+        """Copy incident evidence. A failed consumer transaction leaves it pending."""
+        with self._lock:
+            overflow = [self._witness_overflow] if self._witness_overflow else []
+            return deepcopy([*overflow, *self._witnesses])
+
+    def acknowledge_witnesses(self, identifiers):
+        """Acknowledge exact witness IDs only after the consumer commits them."""
+        identifiers = set(identifiers)
+        with self._lock:
+            self._witnesses = deque(item for item in self._witnesses if item["id"] not in identifiers)
+            if self._witness_overflow and self._witness_overflow["id"] in identifiers:
+                self._witness_overflow = None
+
     def status(self):
         with self._lock:
             return {"state": self._state, "reason": self._reason, "queue_size": len(self._queue),
                     "queue_high_water": self._high_water, "queue_limit": self._limit,
-                    "counts": dict(self._counts), **self._details}
+                    "counts": dict(self._counts), "pending_witness_count": len(self._witnesses),
+                    "witness_overflow": deepcopy(self._witness_overflow), **self._details}
+
+    def _witness_locked(self, kind, at, mono, **details):
+        self._witness_sequence += 1
+        witness = {"id": f"{self._feed_instance}:{self._witness_sequence}", "schema": WITNESS_SCHEMA,
+                   "kind": kind, "at": at.isoformat(), "monotonic_ns": mono,
+                   "feed_instance_id": self._feed_instance, "endpoint": URL,
+                   "source": ema.SOURCE, "symbol": ema.SYMBOL, "counts": dict(self._counts),
+                   "subscription_epoch": self._details.get("subscription_epoch"), **deepcopy(details)}
+        if len(self._witnesses) >= WITNESS_LIMIT:
+            lost = self._witnesses.popleft()
+            previous = self._witness_overflow or {}
+            self._counts["witness_overflow"] += 1
+            self._witness_overflow = {
+                **witness, "id": f"{self._feed_instance}:overflow:{self._counts['witness_overflow']}",
+                "kind": "WITNESS_OVERFLOW", "first_lost_at": previous.get("first_lost_at", lost["at"]),
+                "first_lost_id": previous.get("first_lost_id", lost["id"]), "last_lost_id": lost["id"],
+                "dropped_count": previous.get("dropped_count", 0) + 1,
+                "historical_coverage": "UNRESOLVED"}
+        self._witnesses.append(witness)
 
     def _count(self, name, quantity=1):
         with self._lock:
@@ -141,15 +219,27 @@ class KrakenTradeFeed:
         with self._lock:
             self._state, self._reason = state, reason
 
-    def _disconnected(self, reason):
+    def _disconnected(self, reason, *, error=None):
+        at, mono = self._clock()
         with self._lock:
+            previous_state = self._state
             if self._state in {"STREAMING", "SUBSCRIBING"}:
                 self._counts["disconnects"] += 1
-            self._counts["discarded_on_disconnect"] += len(self._queue)
+            discarded = len(self._queue)
+            first_discarded = deepcopy(self._queue[0]) if self._queue else None
+            last_discarded = deepcopy(self._queue[-1]) if self._queue else None
+            self._counts["discarded_on_disconnect"] += discarded
             self._queue.clear()
             self._state = "BACKOFF"
             self._reason = reason
-            self._details["disconnected_at"] = self._clock()[0].isoformat()
+            self._details["disconnected_at"] = at.isoformat()
+            self._awaiting_recovery = True
+            self._witness_locked("DISCONNECTED", at, mono, reason=reason, prior_state=previous_state,
+                                 exception=_exception_details(error), last_accepted_reference=self._last_point,
+                                 discarded_count=discarded, first_discarded_reference=first_discarded,
+                                 last_discarded_reference=last_discarded,
+                                 subscription={key: value for key, value in self._details.items()
+                                               if key.startswith("subscription_")})
 
     def _message(self, raw, received, session, generation):
         if not isinstance(raw, bytes) or len(raw) > MAX_MESSAGE_BYTES:
@@ -190,6 +280,8 @@ class KrakenTradeFeed:
                 self._state, self._reason = "STREAMING", None
                 self._details.update(ack)
                 self._counts["subscriptions_acknowledged"] += 1
+                self._witness_locked("SUBSCRIPTION_ACKNOWLEDGED", local, recv_mono,
+                                     subscription=ack, reference_quality="NO_PRICE_OBSERVATION")
             return {**session, "ack": ack, "gate": incoming}
         if channel in {"heartbeat", "status"}:
             self._count(channel)
@@ -247,13 +339,22 @@ class KrakenTradeFeed:
         self._last_id, self._last_source = identity, source
         with self._lock:
             if len(self._queue) == self._limit:
-                self._queue.popleft()
+                dropped = self._queue.popleft()
                 self._counts["queue_dropped"] += 1
                 self._details["last_queue_drop_at"] = at.isoformat()
+                self._witness_locked("QUEUE_DROPPED", at, mono, reason="KRAKEN_CONSUMER_QUEUE_OVERFLOW",
+                                     last_accepted_reference=self._last_point, dropped_reference=dropped,
+                                     dropped_count=1)
             self._queue.append(point)
             self._high_water = max(self._high_water, len(self._queue))
             self._counts["accepted_at_receipt"] += 1
             self._details["last_trade_received_at"] = at.isoformat()
+            self._last_point = point
+            if self._awaiting_recovery:
+                self._witness_locked("RECOVERY_REFERENCE", at, mono, observation=point,
+                                     reference_quality="ACCEPTED_AT_RECEIPT_REQUIRES_CONSUMER_VALIDATION",
+                                     historical_coverage="PENDING_REVIEW")
+                self._awaiting_recovery = False
 
     def _session(self, generation):
         with self._connect(URL, open_timeout=OPEN_TIMEOUT, close_timeout=1., ping_interval=20., ping_timeout=10.,
@@ -262,6 +363,9 @@ class KrakenTradeFeed:
             socket.send(json.dumps(SUBSCRIBE, separators=(",", ":")))
             self._state_changed("SUBSCRIBING")
             session = {"request": request}
+            with self._lock:
+                self._witness_locked("SUBSCRIPTION_REQUESTED", *request,
+                                     subscription_epoch=generation, requested_at=request[0].isoformat())
             previous = request
             anchor = None
             checked = request[1]
@@ -290,6 +394,7 @@ class KrakenTradeFeed:
     def _run(self):
         delay = 5.
         while not self._stop.is_set():
+            error = None
             try:
                 self._authorize(self._clock()[0])
                 self._state_changed("CONNECTING")
@@ -297,29 +402,31 @@ class KrakenTradeFeed:
                 generation = self.status()["counts"]["connection_attempts"]
                 self._reconnect.clear()
                 why = self._session(generation)
-            except PermissionError:
-                self._disconnected("KRAKEN_PERMISSION_OR_INSTRUMENT_UNAVAILABLE")
+            except PermissionError as exc:
+                self._disconnected("KRAKEN_PERMISSION_OR_INSTRUMENT_UNAVAILABLE", error=exc)
                 self._state_changed("BLOCKED", "KRAKEN_PERMISSION_OR_INSTRUMENT_UNAVAILABLE")
                 if self._stop.wait(60.):
                     break
                 continue
-            except _ChannelRejected:
-                self._disconnected("KRAKEN_TRADE_SUBSCRIPTION_REJECTED")
+            except _ChannelRejected as exc:
+                self._disconnected("KRAKEN_TRADE_SUBSCRIPTION_REJECTED", error=exc)
                 self._state_changed("BLOCKED", "KRAKEN_TRADE_SUBSCRIPTION_REJECTED")
                 break
             except InvalidStatus as exc:
+                error = exc
                 code = exc.response.status_code
                 why = f"KRAKEN_WEBSOCKET_HTTP_{code}"
                 if code in (401, 403, 451):
-                    self._disconnected(why)
+                    self._disconnected(why, error=error)
                     self._state_changed("BLOCKED", why)
                     break
                 if code == 429:
                     delay = 60.
             except (OSError, WebSocketException, ValueError, KeyError, TypeError) as exc:
+                error = exc
                 why = str(exc) if isinstance(exc, ValueError | TimeoutError) and str(exc).isupper() else type(exc).__name__
             live = self.status().get("state") == "STREAMING"
-            self._disconnected(why)
+            self._disconnected(why, error=error)
             if self._stop.wait(5. if live else delay):
                 break
             delay = 5. if live else min(2 * delay, 60.)

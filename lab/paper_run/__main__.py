@@ -2,9 +2,13 @@
 
 import argparse
 from contextlib import closing
+import getpass
+from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sqlite3
+from uuid import uuid4
 
 import pandas as pd
 
@@ -140,6 +144,58 @@ def entries_off():
     return {"state": "CURRENT_ENTRIES_PAUSED", "generation": record["id"], "runner": runtime.ensure_runner()}
 
 
+def _entry_pause(generation, now):
+    record = runtime.current()
+    if not record or record["id"] != generation:
+        raise ValueError("The requested generation does not match the current paper generation")
+    path = gate.ROOT / "entries-paused"
+    if path.is_symlink():
+        raise ValueError("The entry pause marker must be a regular file")
+    if not path.exists():
+        return path, None, None
+    raw = path.read_bytes()
+    marker = json.loads(raw)
+    if not isinstance(marker, dict) or marker.get("generation") != generation:
+        raise ValueError("The entry pause marker does not match the current generation")
+    paused = pd.Timestamp(marker.get("paused_at"))
+    if pd.isna(paused) or paused.tzinfo is None or utc(paused) > now:
+        raise ValueError("The entry pause timestamp is invalid or future dated")
+    return path, raw, marker
+
+
+def entries_on(generation, *, approve=False):
+    """Preview release of the current entry pause; approval records authority before release."""
+    now = utc_now()
+    path, raw, marker = _entry_pause(generation, now)
+    if approve is not True:
+        return {"state": "ENTRY_RESUME_PREVIEW", "generation": generation,
+                "paused": raw is not None, "requires_explicit_operator_approval": True,
+                "pause_marker": marker, "pause_sha256": sha256(raw).hexdigest() if raw is not None else None}
+    with writer_lock(gate.ROOT / ".writer.lock"):
+        now = utc_now()
+        path, raw, marker = _entry_pause(generation, now)
+        if raw is None:
+            return {"state": "CURRENT_ENTRIES_ALREADY_ENABLED", "generation": generation}
+        identifier = uuid4().hex
+        authorization = {"schema": "CURRENT_ENTRY_CONTROL_AUTHORIZATION_V1", "id": identifier,
+                         "generation": generation, "action": "ENTRIES_ON", "operator": getpass.getuser(),
+                         "authorized_at": now.isoformat(), "pause_sha256": sha256(raw).hexdigest(),
+                         "pause_marker": marker}
+        folder = gate.ROOT / "entries-controls"
+        folder.mkdir(parents=True, exist_ok=True)
+        saved = folder / f"{identifier}.json"
+        encoded = json.dumps(authorization, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
+        with saved.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if saved.read_bytes() != encoded or path.is_symlink() or path.read_bytes() != raw:
+            raise ValueError("Entry-control evidence changed before the pause could be released")
+        path.unlink()
+        return {"state": "CURRENT_ENTRIES_ENABLED", "generation": generation,
+                "authorization_path": str(saved), "authorization_sha256": sha256(encoded).hexdigest()}
+
+
 def amend_ema_source(path):
     record = runtime.current()
     if not record:
@@ -174,13 +230,28 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("status", "run"):
         commands.add_parser(name)
-    commands.add_parser("entries").add_argument("state", choices=("off",))
+    entries = commands.add_parser("entries")
+    entries.add_argument("state", choices=("off", "on"))
+    entries.add_argument("--generation", help="Exact current generation required for entries on")
+    entries.add_argument("--approve", action="store_true", help="Explicitly approve releasing the current entry pause")
     commands.add_parser("probe").add_argument("--save", type=Path)
+    operator_close = commands.add_parser("operator-close", help="Preview a targeted administrative paper exit")
+    operator_close.add_argument("--request", type=Path, required=True)
+    operator_close.add_argument("--apply", action="store_true")
+    operator_close.add_argument("--approve", action="store_true", help="Approve only the exact requested paper position")
     commands.add_parser("amend-ema-source").add_argument("--measurement", required=True, type=Path)
     commands.add_parser("verify-archive").add_argument("path", type=Path)
     transition = commands.add_parser("cutover")
     transition.add_argument("--archive-parent", type=Path, default=ARCHIVE_PARENT)
     transition.add_argument("--preflight", type=Path)
+    protection = commands.add_parser("protection")
+    operations = protection.add_subparsers(dest="operation", required=True)
+    operations.add_parser("report").add_argument("--slot", required=True)
+    for operation in ("activate", "adjudicate", "resume"):
+        action = operations.add_parser(operation)
+        action.add_argument("--request", type=Path, required=True)
+        action.add_argument("--apply", action="store_true")
+        action.add_argument("--approve", action="store_true", help="Explicitly authorize the reviewed state change")
     args = parser.parse_args()
     if args.command == "run":
         try:
@@ -190,16 +261,30 @@ def main():
         return
     actions = {
         "status": runtime.status,
+        "operator-close": lambda: operator_close_action(args),
         "probe": lambda: probe(args.save),
         "amend-ema-source": lambda: amend_ema_source(args.measurement),
-        "entries": entries_off,
+        "entries": lambda: entries_off() if args.state == "off" else entries_on(args.generation, approve=args.approve),
         "verify-archive": lambda: archive.verify(args.path),
         "cutover": lambda: cutover(args.archive_parent, args.preflight),
+        "protection": lambda: protection_action(args),
     }
     try:
         print(json.dumps(actions[args.command](), indent=2, default=str, allow_nan=False))
     except (ValueError, OSError, RuntimeError, sqlite3.Error) as error:
         parser.exit(1, f"Paper run: {error}\n")
+
+
+def protection_action(args):
+    from lab.paper_run.protection_commands import command
+
+    return command(args)
+
+
+def operator_close_action(args):
+    from lab.paper_run.operator_close import command
+
+    return command(args)
 
 
 if __name__ == "__main__":

@@ -139,8 +139,13 @@ def test_current_inventory_and_trade_stats_never_include_retired_book(ledgers, m
         raising=False)
     book = view["books"]["breakout/day/fixed"]
     add_event(source, "historic-loss", book="retired-book", kind="CLOSED", body={"net": -900.})
-    add_event(source, "only-current", book=book["book_id"], kind="CLOSED", body={"net": 10.})
+    add_event(source, "only-current", book=book["book_id"], kind="CLOSED",
+              body={"net": 10., "net_r": 1., "fees": 0., "funding": 0., "holding_minutes": 1.})
     source.commit()
+    from lab.paper_run import protection_reporting
+
+    for item in view["books"].values():
+        item.update(protection_reporting.summarize(source, item, item))
     current = presentation.current_view()
     assert set(current["books"]) == set(SLOTS)
     assert current["archive"] == "private-archive"
