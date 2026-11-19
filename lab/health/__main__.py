@@ -148,6 +148,19 @@ def _kraken_reference_continuity(reference, now, source_root):
 PAPER_ERRORS = (ImportError, OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, psutil.Error)
 
 
+def _scan_fresh_operations(db, now):
+    """Independent read-only scanner; no producer supervision or Telegram here."""
+    from lab.health import fresh_paper_health
+
+    try:
+        return fresh_paper_health.collect(db, now)
+    except PAPER_ERRORS as exc:
+        try:
+            return fresh_paper_health.failed(db, now, "PAPER_OPERATIONAL_SCANNER_" + type(exc).__name__)
+        except PAPER_ERRORS:
+            return {"state": "CHECK_FAILED", "reason": "PAPER_OPERATIONAL_SCANNER_AND_OUTBOX_UNAVAILABLE"}
+
+
 def _dispatch_ema():
     evidence = {}
     baseline = None
@@ -310,6 +323,8 @@ def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
                     set_meta(db, "ema_private_watchdog_previous", epoch)
             except PAPER_ERRORS as exc:
                 evidence["fresh_paper_notifications"] = {"state": "CHECK_FAILED", "reason": type(exc).__name__}
+            _stage("fresh_paper_operational_scan")
+            evidence["fresh_paper_operational_health"] = _scan_fresh_operations(db, utc_now())
         if not fresh and "ema_paper" in evidence:
             _stage("ema_notification_scan")
             try:
@@ -384,7 +399,7 @@ def _check_health(evidence, baseline, *, before, cpu, deliver, mode):
             _stage("telegram_delivery")
             route = None
             if private_route and db.execute("SELECT 1 FROM outbox WHERE id LIKE 'ema-private:%' "
-                                            "AND status IN ('PENDING','RETRY') AND due<=? LIMIT 1", (epoch,)).fetchone():
+                                            "AND status IN ('PENDING','RETRY') AND due<=? LIMIT 1", (time.time(),)).fetchone():
                 try:
                     candidate = private_telegram.destination()
                     if candidate.identifier == private_route:
@@ -493,6 +508,10 @@ def _operational_status():
     if outbox.is_file():
         try:
             with closing(sqlite3.connect(outbox.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
+                if fresh:
+                    from lab.health import fresh_paper_health
+
+                    result["fresh_paper_operational_monitor"] = fresh_paper_health.status(db, utc_now())
                 result["telegram_trade_delivery"] = [
                     {"category": category, "state": state, "count": count}
                     for category, state, count in db.execute(
@@ -550,6 +569,8 @@ def main():
     for name in ("status","test-telegram","dashboard-status","recover-dashboard","stop-local","task-status"):
         sub.add_parser(name)
     sub.add_parser("enable-ema-private-telegram", help="verify the existing private route and baseline new EMA events")
+    operational_test = sub.add_parser("test-operational-alert", help="queue one explicitly authorized private operational TEST")
+    operational_test.add_argument("--request-id", required=True)
     sub.add_parser("alerts").add_argument("--idea", help="Show delivery attempts for one full paper idea ID")
     run=sub.add_parser("check-once")
     run.add_argument("--no-send",action="store_true")
@@ -591,6 +612,11 @@ def main():
         with writer_lock(ROOT/".check.lock"), connect() as db, db:
             enabled = private_notifications.enable(db, route.identifier, utc_now())
             result = {"state": "PRIVATE_SUMMARIES_ENABLED", "enabled_at": enabled["enabled_at"]}
+    elif command == "test-operational-alert":
+        from lab.health import fresh_paper_health
+
+        with writer_lock(ROOT/".check.lock"), connect() as db, db:
+            result = fresh_paper_health.queue_test(db, utc_now(), args.request_id)
     elif command in {"alerts","test-telegram","mute","category","position-interval"}:
         with writer_lock(ROOT/".check.lock"),connect() as db:
             if command=="alerts":

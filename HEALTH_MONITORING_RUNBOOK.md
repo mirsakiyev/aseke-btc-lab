@@ -64,6 +64,44 @@ After the three EMA paper books are registered, scheduled checks also record `em
 
 The notifier reuses the existing DPAPI credentials and authorized destination. The watchdog can send while Codex is closed. Keep the credential file restricted to the Windows account running the watchdog, SYSTEM and Administrators. The token is used only to call the official HTTPS Bot API. [Telegram Bot API](https://core.telegram.org/bots/api)
 
+## Current-generation operational alerts
+
+`lab.health.fresh_paper_health` is a health-only reader. It discovers the sealed current registration and, when installed, the supported `membership.lanes(record, db=source)` amendment projection. It never changes paper state, supervises a runner, acquires the financial writer lease or sends Telegram. Installing this reader does not change financial `RUNNER_BUILD`.
+
+Its separate durable per-book operational cursor follows committed protection and operational events independently from trade-notification cursors. First commissioning baselines historical events and immediately reports a currently blocked book. Later checks report changed reasons, distinct incidents, accepted protection recovery and actual prospective entry availability. A future-dated approved resume is labelled **FUTURE ADMISSION PENDING**. Source recovery does not imply entry restoration. An occupied ACTIVE book is not available for an overlapping entry; historical uncertainty may remain after a valid resume.
+
+Positive eligibility notices require a drained incident/event backlog, a consistent current snapshot, current clock/source/control and qualification gates, a flat book with no pending entry, and a valid resume newer than any relevant historical restriction. A stale snapshot, revoked old permission or new incident cannot announce recovery. Shared-source events are matched by explicit source-scope identity. A newly registered flat consumer can inherit a current source restriction without a fictitious exposure incident. Missing or malformed registered-book evidence is isolated and reported; healthy books continue to be scanned.
+
+Commission from the project root using operator mode:
+
+```powershell
+.\health.ps1 check-once --no-send
+.\health.ps1 alerts
+.\health.ps1 check-once
+.\health.ps1 status
+```
+
+Do not add `--scheduled` to manual commissioning. Operator-mode checks do not dispatch financial-runner supervision. `--no-send` still writes health state, outbox rows and cursors; inspect the new `ema-private:fresh-health:` rows before delivery. The full receipt contains `fresh_paper_operational_health`, version `fresh-paper-operational-health-v1`, per-book cursors, backlog and snapshot-consistency evidence. `status.current.fresh_paper_operational_monitor` reports a missing, stale or inaccessible scanner receipt explicitly. Its 420-second stale threshold describes monitoring evidence and does not alter any trading deadline.
+
+If no genuine current restriction exists, an explicitly authorized commissioning TEST can be queued through the same guarded private health route:
+
+```powershell
+# Use one unique request identity, and retain it for any interrupted retry.
+.\health.ps1 test-operational-alert --request-id $operationalTestRequestId
+.\health.ps1 alerts
+.\health.ps1 check-once
+```
+
+This command queues only. It says **OPERATIONAL NOTIFICATION TEST** and **No real incident or trade occurred**. Repeating the same request does not duplicate the outbox row. It remains category `health`, so existing mute, category, cooldown, retry and ambiguity policies apply. Do not send another connectivity test when the authorization permits only one test. No production feed should be disconnected and no false protection incident should be created for commissioning.
+
+Operational rows have no trade `idea_id`, so a failed older entry message cannot hold them behind its per-idea sequence. They use the existing private-route verification, shared `.check.lock` and single durable sender. The ordinary scheduled watchdog loads updated health source on its next run. Verify a receipt with mode `scheduled` and the new collector version while the financial runner's PID/build and open-position protection continue unchanged. Leave the watchdog schedule intact.
+
+The registered cadence remains one full check every three minutes. Full-check work, the five-message batch limit, older eligible health messages, network calls and backoff add queue latency. The outbox and `outbox_attempt` retain enqueue, dispatch, request start/completion, API acceptance and Telegram message IDs. Report those measured timestamps; API acceptance does not prove phone-display time. A faster scanner/service requires its own coordinated release and is not activated by this reader.
+
+On November 18, 2026, operator `--no-send` commissioning enqueued a genuine **EMA Day BLOCKED â€” FUTURE ADMISSION PENDING** notice at **18:26:14.652887 EST**. The ordinary scheduled watchdog loaded the new scanner at **18:26:28.731615 EST** and delivered that notice through the verified private route. Telegram accepted message **379** at **18:26:30.325631 EST**, **15.673 seconds** after enqueue. The request ran from **18:26:29.558822** to **18:26:30.325631 EST**, approximately **0.767 seconds**. The scheduled process completed successfully at **18:26:30.345701 EST**. The subsequent operator check completed at **18:26:38.832997 EST**; it was not the sender of that already-delivered message. No TEST was needed or sent. These receipts establish API acceptance and ordinary-schedule pickup, not phone-display time or a permanent latency guarantee. The financial runner remained PID **16784**, build `e0d54dea9782c6caaa56e330d3b2eb1b439afad2511c77a5b77b12bbabb8036b`, and both open Swing books retained their protection.
+
+To roll back only this bounded release, restore the reviewed preceding health reader/integration source. Preserve `watchdog.sqlite3`, its operational cursors, existing outbox and delivery attempts. Do not reset notification history, change scheduler registration or restart a financial runner as part of a health-only rollback.
+
 Each check attempts at most five messages. Definite connection and Telegram rejections retry with exponential backoff and honor Telegram's requested delay, up to six attempts by default. The watchdog saves the in-flight attempt before sending. If it loses the response or crashes after Telegram may have accepted the request, the next check marks that attempt `UNCERTAIN` and leaves it for review. Telegram and the local SQLite outbox have no shared exactly-once transaction. This workstation cannot notify while powered off, offline, or unable to run the watchdog. An independent off-host heartbeat service would be needed to detect a full host outage.
 
 ## Phase 15 paper lifecycle
@@ -78,11 +116,11 @@ Use `.phase15.ps1 status` for the current books and their recent saved events. U
 
 | Category | Authoritative source | Example |
 | --- | --- | --- |
-| `ideas` | Committed `PUBLISHED` | **EXPERIMENTAL IDEA** · Day SHORT · frozen entry range, stop, illustrative 2R target and entry expiry |
-| `paper_entry` | Committed `HYPOTHETICAL_FILL` | **PAPER ENTRY CONFIRMED — DELAYED** · modeled UTC time, ledger receipt time and position size · fill-based target |
-| `paper_no_entry` | Committed `EXPIRED` or `INVALIDATED` for an unfilled idea | **NO PAPER ENTRY** · EXPIRED · entry window elapsed |
-| `paper_exit` | Committed `CLOSED` | **PAPER TRADE CLOSED — DELAYED** · exit reason, net P&L and updated equity |
-| `open_position` | Current saved nonflat book and its last accounted price | **OPEN PAPER POSITION UPDATE** · last accounted mark time · stale or unverified at check · unrealized P&L and remaining holding time |
+| `ideas` | Committed `PUBLISHED` | **EXPERIMENTAL IDEA** Â· Day SHORT Â· frozen entry range, stop, illustrative 2R target and entry expiry |
+| `paper_entry` | Committed `HYPOTHETICAL_FILL` | **PAPER ENTRY CONFIRMED â€” DELAYED** Â· modeled UTC time, ledger receipt time and position size Â· fill-based target |
+| `paper_no_entry` | Committed `EXPIRED` or `INVALIDATED` for an unfilled idea | **NO PAPER ENTRY** Â· EXPIRED Â· entry window elapsed |
+| `paper_exit` | Committed `CLOSED` | **PAPER TRADE CLOSED â€” DELAYED** Â· exit reason, net P&L and updated equity |
+| `open_position` | Current saved nonflat book and its last accounted price | **OPEN PAPER POSITION UPDATE** Â· last accounted mark time Â· stale or unverified at check Â· unrealized P&L and remaining holding time |
 
 `ENTRY_OBSERVED` alone generates no entry alert. A fill suppresses a pending contradictory unfilled alert. Exit messages use the saved gross, fees, funding, liquidation costs and net. Adverse execution is already included in gross. When saved closing equity cannot be reconciled, the alert includes an accounting warning. Updated events add notification evidence to the normal ledger commit. The watchdog opens a read-only snapshot and does no accounting.
 
@@ -111,3 +149,11 @@ Futures minutes arrive in 15-minute captures. A healthy watchdog adds up to one 
 The defaults use three warning checks, two critical checks, two good checks for recovery, and a four-hour unresolved-incident reminder. Verified severe events such as a stopped worker or permanently blocked book can alert immediately. During the first three minutes after Windows boots, stopped-worker findings use the ordinary two-check threshold. Futures funding has a two-hour receipt grace. Ordinary BTC-USDT Spot requires trades only. Idea alerts start at watchdog commissioning and use saved Phase 15 `PUBLISHED` events with stable idea IDs, actual published prices and experimental classification.
 
 To tune watchdog thresholds, edit the corresponding keys from `.\health.ps1 status` in `runs/health/controls.json`. Use an optional boolean `recurring_expected` if the intended recurring-learning setting changes. That setting describes what the watchdog should expect. Change learning itself through the existing learning controls. The 1,250 MiB memory and 2,048 MiB disk warnings match the research reserves. Alert thresholds have no effect on collection, risk policy, training admission, or order execution.
+
+
+Operational alert commissioning on November 18 recorded genuine private Telegram messages 379 and 380. Message 379 was accepted 15.673 seconds after enqueue; the restored-eligibility message 380 took 181.845 seconds. These are enqueue-to-API-acceptance measurements, not phone-display times. The three-minute watchdog schedule remains unchanged. The latter notice missed same-check destination verification because the query compared its fractional due time to the integer check-start epoch. The installed health-only correction compares due time with the actual dispatch-time clock; tests/test_health_due_time.py verifies same-check routing without weakening mute, retry, backoff, uncertain-send or shared-lock rules. This fix removes that avoidable extra scan, not the normal polling delay. No additional operational TEST was sent.
+
+ After the correction, the ordinary 19:02 EST scheduled check queued two genuine Swing funding-evidence restrictions at 00:02:28.934518 UTC. Telegram accepted messages 381 and 382 at 00:02:30.551437 and 00:02:31.323129 UTC, respectively: 1.617 and 2.389 seconds after enqueue in that same check. These were real current accounting restrictions, not operational TESTs. Detection still follows the unchanged three-minute schedule.
+
+
+The November 18 Swing funding audit added a health-only legacy clearance observer. It first baselines the exact open position and unresolved costs, then requires new committed matching FUNDING receipts, the applied settlement markers, finite reconciled nominal accounts, a consistent snapshot and drained backlog. Its notice says FUNDING RESTRICTION CLEARED, position OPEN, entry OCCUPIED; it never treats fresh prices as financial evidence or announces entry restored for an occupied book. It is disabled for versioned funding projections, whose canonical transitions own the notification. The financial runner is not restarted by commissioning.
