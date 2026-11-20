@@ -1,0 +1,3 @@
+# Preserve the raw bytes bound by the registered EMA evaluator specifications.
+lab/strategy_lab/ema_execution.py text eol=lf
+lab/strategy_lab/ema_pullback.py text eol=lf

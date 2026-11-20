@@ -7,6 +7,27 @@ from lab.storage import RUNS, read_json
 
 
 ROOT = RUNS / "paper-run"
+RESET_FILE = "generation-reset.json"
+
+
+def reset_intent():
+    path = ROOT / RESET_FILE
+    if not path.exists():
+        return None
+    record = read_json(path)
+    if fingerprint(record["body"]) != record["id"]:
+        raise ValueError("Paper generation reset checksum differs")
+    return record["body"]
+
+
+def reset_pending():
+    intent = reset_intent()
+    return bool(intent and intent["phase"] != "COMPLETE")
+
+
+def stop_requested(generation):
+    path = ROOT / "runner-stop.json"
+    return path.exists() and read_json(path)["generation"] == generation
 
 
 def retirement_path(root=None):

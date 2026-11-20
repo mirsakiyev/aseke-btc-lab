@@ -63,7 +63,10 @@ def emit(context, *, price='99.', event_id=92, accept=True, at=None, **changes):
     point.update(changes)
     context.now[0] = at + pd.Timedelta(milliseconds=125)
     if accept:
-        runtime.live_prices(context.record, context.amendment, [point], {})
+        # A live collector delivers current transport diagnostics with its point.
+        # Long funding-boundary jumps must not rely on a stale disk heartbeat.
+        runtime.live_prices(context.record, context.amendment, [point],
+                            {'state': 'STREAMING', 'at': context.now[0].isoformat()})
     else:
         with closing(runtime.connect()) as db, db:
             state = runtime._source_state(db, context.lane['source'])

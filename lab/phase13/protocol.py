@@ -40,9 +40,11 @@ def set_control(enabled):
 
 
 def current_metadata():
+    from lab import runtime_snapshot
     from lab.phase10.worker import STATE
+
     path = STATE / "metadata.json"
-    return read_json(path) if path.exists() else metadata()
+    return runtime_snapshot.read(path, lambda: read_json(path) if path.exists() else metadata())
 
 
 def register(now=None):

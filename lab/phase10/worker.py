@@ -1,8 +1,12 @@
 from datetime import timedelta
+from contextlib import ExitStack, contextmanager
+from hashlib import sha256
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -13,6 +17,7 @@ import httpx
 import pandas as pd
 import psutil
 
+from lab import runtime_snapshot
 from lab.config import ROOT, fingerprint
 from lab.phase10.observer import Observer
 from lab.phase9.data import candles, inspect_batch, market_quote, mark_quote, metadata
@@ -34,6 +39,133 @@ MAX_REQUESTS_PER_CYCLE = 20
 MAX_RAW_BYTES = 96 * 1024**2
 WAITING = "WAITING_FOR_QUALIFIED_FUTURES_BUNDLE"
 LOG = logging.getLogger("lab.phase10")
+BACKOFF_SCHEMA = "PHASE10_BACKOFF_V1"
+RUNTIME_REPLACE_DELAYS = (.05, .1)
+LOADED_WORKER_SOURCE_SHA256 = sha256(Path(__file__).read_bytes()).hexdigest()
+LOADED_SNAPSHOT_SOURCE_SHA256 = sha256(Path(runtime_snapshot.__file__).read_bytes()).hexdigest()
+SOURCE_REQUEST_SCHEMA = "PHASE10_SOURCE_REQUEST_V1"
+INFLIGHT_PERMISSION_SECONDS = 5
+
+
+class SourceOutcomePending(RuntimeError):
+    """A short source-result publication still owns its admission fence."""
+
+
+@contextmanager
+def source_outcome_lock(*, wait_seconds=.15):
+    """Serialize only result publication and tiny permission reads, never HTTP."""
+    if not 0 <= wait_seconds <= .2:
+        raise ValueError("Source outcome fence wait must be bounded to 200ms")
+    started = time.monotonic()
+    deadline = started + wait_seconds
+    with ExitStack() as stack:
+        while True:
+            try:
+                stack.enter_context(writer_lock(STATE / ".source-outcome.lock"))
+                break
+            except RuntimeError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SourceOutcomePending("Phase 10 source outcome publication is pending") from exc
+                time.sleep(min(.01, remaining))
+        yield max(0., time.monotonic() - started)
+
+
+def live_request(row, now):
+    """A young, exact-build, OS-owned request is ordinary concurrent HTTP.
+
+    Five seconds is a conservative permission window, not a promise of total
+    httpx wall time. Older intents remain unknown until their result commits.
+    The caller must already hold source_outcome_lock while reading metadata.
+    """
+    try:
+        intent = row["active_request"]
+        if (not isinstance(intent, dict) or intent.get("schema") != SOURCE_REQUEST_SCHEMA
+                or not isinstance(intent.get("key"), str) or not intent["key"]
+                or row.get("worker_stage") != "COLLECTING" or row.get("stopped_at")
+                or row.get("worker_source_sha256") != LOADED_WORKER_SOURCE_SHA256
+                or type(row.get("pid")) is not int or row["pid"] <= 0
+                or not isinstance(row.get("launch_id"), str) or not row["launch_id"]
+                or type(row.get("created")) not in (int, float) or not math.isfinite(row["created"])):
+            return False
+        if any(intent.get(key) != row[key] for key in ("pid", "created", "launch_id")):
+            return False
+        mono_start, mono_finish = request_monotonic_window(intent)
+        if not mono_start <= time.monotonic() <= mono_finish:
+            return False
+        started, finish = pd.Timestamp(intent["started_at"]), pd.Timestamp(intent["permission_until"])
+        if (pd.isna(started) or pd.isna(finish) or started.tzinfo is None or finish.tzinfo is None
+                or finish != started + pd.Timedelta(seconds=INFLIGHT_PERMISSION_SECONDS)
+                or not started <= now <= finish):
+            return False
+        return psutil.Process(row["pid"]).create_time() == row["created"] and worker_lock_held()
+    except (KeyError, TypeError, ValueError, OverflowError, OSError, psutil.Error):
+        return False
+
+
+def request_monotonic_window(intent):
+    """The cross-process Windows monotonic window cannot revive after a clock step."""
+    start, finish = intent["started_monotonic"], intent["permission_monotonic_until"]
+    if (type(start) not in (int, float) or type(finish) not in (int, float)
+            or not math.isfinite(start) or not math.isfinite(finish) or start < 0
+            or finish != start + INFLIGHT_PERMISSION_SECONDS):
+        raise ValueError("Invalid source-request monotonic permission window")
+    return start, finish
+
+
+class RuntimePersistenceError(OSError):
+    """Publishing worker metadata failed; no market request is implied."""
+
+    def __init__(self, original):
+        super().__init__(f"Phase 10 runtime persistence failed at {RUNTIME}: {original}")
+        self.original = original
+
+
+class ResearchPersistenceError(OSError):
+    """An explicitly local research file operation failed outside HTTP."""
+
+    def __init__(self, original, operation):
+        super().__init__(f"Phase 10 local research storage failed ({operation}): {original}")
+        self.original, self.operation = original, operation
+
+
+def research_io(operation, *args, **kwargs):
+    """Classify only OSError from an explicitly local operation, never send()."""
+    try:
+        return operation(*args, **kwargs)
+    except OSError as exc:
+        raise ResearchPersistenceError(exc, operation.__name__) from exc
+
+
+def set_backoff(row, cause, seconds, *, scope, at=None, retry_at=None, **details):
+    """Keep research retries separate from durable source-wide restrictions."""
+    now = utc_now() if at is None else utc(at)
+    until = now + pd.Timedelta(seconds=seconds) if retry_at is None else utc(retry_at)
+    source = row.get("source_backoff")
+    # A local failure must never shorten or erase an existing source breaker.
+    if isinstance(source, dict) and source.get("retry_at"):
+        until = max(until, utc(source["retry_at"]))
+    evidence = {"schema": BACKOFF_SCHEMA, "origin": "lab.phase10.worker", "scope": scope,
+                "cause": cause, "at": now.isoformat(), "retry_at": until.isoformat(), **details}
+    row.update(retry_at=until.isoformat(), backoff=evidence)
+    if scope == "SHARED_KUCOIN_SOURCE":
+        row["source_backoff"] = dict(evidence)
+
+
+def record_cycle_failure(row, exc, *, at=None):
+    if isinstance(exc, CorruptRuntime):
+        # Invalid persisted provenance needs review, not a new default timeout.
+        raise exc
+    now = utc_now() if at is None else utc(at)
+    local = isinstance(exc, (RuntimePersistenceError, ResearchPersistenceError))
+    original = exc.original if local else exc
+    details = {"error_type": type(original).__name__, "errno": getattr(original, "errno", None),
+               "winerror": getattr(original, "winerror", None)}
+    row["last_error"] = {"at": now.isoformat(), "reason": str(exc), **details}
+    cause = ("LOCAL_RUNTIME_PERSISTENCE" if isinstance(exc, RuntimePersistenceError) else
+             "LOCAL_RESEARCH_STORAGE" if local else "UNCLASSIFIED_WORKER_ERROR")
+    set_backoff(row, cause, 30,
+                scope="RESEARCH_WORKER" if local else "SHARED_KUCOIN_SOURCE", at=now, **details)
 
 
 def optional(path, fallback):
@@ -44,12 +176,56 @@ class CorruptRuntime(ValueError):
     """The persisted worker identity needs an explicit, ownership-checked repair."""
 
 
+def require_completed_request(row):
+    """Do not erase a prior durable request whose outcome never committed."""
+    if row.get("active_request") is not None:
+        raise RuntimeError(
+            f"Unresolved Phase 10 source-request outcome at {RUNTIME}. Preserve the runtime and request evidence; "
+            "verify worker/observer ownership and source restrictions before an explicit repair."
+        )
+
+
+def validate_backoff(row, *, at=None):
+    """Never acquire fresh evidence by overwriting an inconsistent breaker."""
+    now = utc_now() if at is None else utc(at)
+
+    def explicit_stamp(value):
+        stamp = pd.Timestamp(value)
+        if pd.isna(stamp) or stamp.tzinfo is None:
+            raise ValueError("Backoff timestamp must be explicit")
+        return stamp.tz_convert("UTC")
+
+    try:
+        windows = {}
+        for name in ("backoff", "source_backoff"):
+            value = row.get(name)
+            if value is None:
+                continue
+            if (not isinstance(value, dict) or value.get("schema") != BACKOFF_SCHEMA
+                    or value.get("origin") != "lab.phase10.worker"
+                    or value.get("scope") not in ("RESEARCH_WORKER", "SHARED_KUCOIN_SOURCE")
+                    or not isinstance(value.get("cause"), str) or not value["cause"]):
+                raise ValueError("Unknown backoff provenance")
+            start, finish = explicit_stamp(value["at"]), explicit_stamp(value["retry_at"])
+            if start > now or start >= finish or name == "source_backoff" and value["scope"] != "SHARED_KUCOIN_SOURCE":
+                raise ValueError("Inconsistent backoff provenance")
+            windows[name] = finish
+        retry = explicit_stamp(row["retry_at"]) if row.get("retry_at") is not None else None
+        if "backoff" in windows and retry != windows["backoff"]:
+            raise ValueError("Worker retry checkpoint disagrees with scope")
+        source = windows.get("source_backoff")
+        if source is not None and now < source and (retry is None or retry < source):
+            raise ValueError("Worker retry would bypass an undischarged source restriction")
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise CorruptRuntime(
+            f"Inconsistent Phase 10 runtime backoff at {RUNTIME}. Preserve it and verify ownership and source restrictions before repair."
+        ) from exc
+
+
 def read_runtime():
     try:
-        row = read_json(RUNTIME)
-    except FileNotFoundError:
-        return {}
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        row = runtime_snapshot.read(RUNTIME, lambda: optional(RUNTIME, {}))
+    except ValueError as exc:
         raise CorruptRuntime(f"Invalid Phase 10 runtime JSON at {RUNTIME}. Preserve it and verify the worker and observer locks before repair.") from exc
     if not isinstance(row, dict):
         raise CorruptRuntime(f"Phase 10 runtime at {RUNTIME} must contain a JSON object.")
@@ -57,7 +233,17 @@ def read_runtime():
 
 
 def write_runtime(row):
-    """Flush the replacement's contents before publishing its name."""
+    runtime_snapshot.publish(RUNTIME, row, cleanup=False)
+
+
+def write_legacy_runtime(row):
+    """Flush once, then retry only bounded Windows replace contention.
+
+    This is a fenced compatibility export for an older stopped worker.
+    WinError5 can also mean a permanent ACL denial. Three total attempts and
+    150ms total delay do not reinterpret it as success or change permissions.
+    The old file is never truncated, deleted or replaced with a default.
+    """
     body = json.dumps(row, indent=2, default=str, allow_nan=False).encode("utf-8")
     RUNTIME.parent.mkdir(parents=True, exist_ok=True)
     temporary = RUNTIME.with_name(f".{uuid4().hex}.tmp")
@@ -66,9 +252,20 @@ def write_runtime(row):
             handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.replace(RUNTIME)
+        for attempt in range(len(RUNTIME_REPLACE_DELAYS) + 1):
+            try:
+                temporary.replace(RUNTIME)
+                break
+            except OSError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == len(RUNTIME_REPLACE_DELAYS):
+                    raise
+                time.sleep(RUNTIME_REPLACE_DELAYS[attempt])
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Never mask the primary replace error or truncate its old target.
+            LOG.exception("Phase 10 temporary runtime cleanup failed: %s", temporary)
 
 
 def worker_lock_held():
@@ -142,13 +339,18 @@ def cache_read(name):
 
 def cache_save(name, frame):
     path = STATE / "candles" / f"{name}.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{uuid4().hex}.tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(temporary, index=False)
         temporary.replace(path)
+    except OSError as exc:
+        raise ResearchPersistenceError(exc, f"cache_save:{name}") from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            LOG.exception("Phase 10 temporary research cache cleanup failed: %s", temporary)
 
 
 def missing_requests(name, mode, frame, close, budget):
@@ -199,24 +401,77 @@ class Worker:
         self.used = sum(item.stat().st_size for item in self.raw.glob("*") if item.is_file())
         self.frames = {name: cache_read(name) for name in NAMES}
         self.rules = metadata()
-        prior_rules = optional(STATE / "metadata.json", {})
+        path = STATE / "metadata.json"
+        prior_rules = runtime_snapshot.read(path, lambda: optional(path, {}))
         if prior_rules.get("as_of") and utc(prior_rules["as_of"]) > utc(self.rules.get("as_of") or "2000-01-01"):
             self.rules = prior_rules
 
     def save(self):
-        self.rt["heartbeat"] = utc_now().isoformat()
-        self.rt["raw_bytes"] = self.used
-        write_runtime(self.rt)
+        candidate = {**self.rt, "heartbeat": utc_now().isoformat(), "raw_bytes": self.used}
+        try:
+            write_runtime(candidate)
+        except OSError as exc:
+            raise RuntimePersistenceError(exc) from exc
+        # A failed write must not advance even the in-memory success heartbeat.
+        self.rt.update(heartbeat=candidate["heartbeat"], raw_bytes=candidate["raw_bytes"])
+        if getattr(self, "_known_source_result", False) and self.rt.get("active_request") is None:
+            self.release_source_outcome()
+
+    def hold_source_outcome(self):
+        if getattr(self, "_source_outcome_guard", None) is None:
+            try:
+                _, permission_end = request_monotonic_window(self.rt["active_request"])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                # Such an intent is never eligible for live_request admission.
+                raise SourceOutcomePending("Unverified source-request permission window") from exc
+            # Paper reads wait at most 150ms. A producer may wait longer after
+            # HTTP, so a slow permission reader cannot leave a young admissible
+            # intent with a completed but unpublished rate-limit/access result.
+            # Once this loop fails, monotonic live permission is already over,
+            # even if Windows wall time steps backwards during the wait.
+            acquire_end = permission_end + .01
+            while True:
+                remaining = max(0., acquire_end - time.monotonic())
+                guard = source_outcome_lock(wait_seconds=min(.15, remaining))
+                try:
+                    guard.__enter__()
+                except (SourceOutcomePending, OSError) as exc:
+                    remaining = acquire_end - time.monotonic()
+                    if remaining <= 0:
+                        raise SourceOutcomePending(
+                            "Source result could not acquire its fence; monotonic request permission expired"
+                        ) from exc
+                    time.sleep(min(.01, remaining))
+                else:
+                    self._source_outcome_guard = guard
+                    break
+
+    def release_source_outcome(self):
+        guard = getattr(self, "_source_outcome_guard", None)
+        if guard is not None:
+            self._source_outcome_guard = None
+            self._known_source_result = False
+            guard.__exit__(None, None, None)
+
+    def save_or_defer(self):
+        """Retain the single owner during failed idle metadata publication."""
+        try:
+            self.save()
+        except RuntimePersistenceError as exc:
+            record_cycle_failure(self.rt, exc)
+            LOG.exception("Phase 10 runtime remains unpersisted; research retry deferred")
+            return False
+        return True
 
     def seed(self, now):
-        folder = latest("current")
+        folder = research_io(latest, "current")
         if not folder or all(not frame.empty for frame in self.frames.values()):
             return
-        plan = read_json(folder / "plan.json")["design"]
+        plan = research_io(read_json, folder / "plan.json")["design"]
         if plan["scope"] != "PROSPECTIVE_FEATURE_WARMUP_ONLY":
             return
-        pinned = read_frozen_reference(plan["reference_id"])["reference"]["profiles"]
-        history, frames, _ = inspect_batch(folder, self.rules)
+        pinned = research_io(read_frozen_reference, plan["reference_id"])["reference"]["profiles"]
+        history, frames, _ = research_io(inspect_batch, folder, self.rules)
         for row in history:
             name = row["key"].split("-", 1)[0]
             if name not in NAMES or row["key"] not in frames or not self.frames[name].empty:
@@ -234,45 +489,77 @@ class Worker:
                                                      utc(item["received_at"]), item["raw_sha256"], cutoff, mode)
 
     def fetch(self, client, spec):
+        require_completed_request(self.rt)
+        validate_backoff(self.rt)
         if (self.remaining <= 0 or controls()["paused"] or not controls()["monitor"]
                 or (self.rt.get("retry_at") and utc_now() < utc(self.rt["retry_at"]))):
             return None
         if self.used + self.budget["maximum_response_bytes"] > MAX_RAW_BYTES:
             self.rt["last_error"] = {"at": utc_now().isoformat(), "reason": "KuCoin raw evidence disk ceiling reached"}
-            self.rt["retry_at"] = (utc_now() + pd.Timedelta("1h")).isoformat()
+            set_backoff(self.rt, "RESEARCH_RAW_CAPACITY", 3600, scope="RESEARCH_WORKER")
             return None
         time.sleep(self.budget["minimum_spacing_seconds"])
         with writer_lock(STATE / ".control.lock"):
             if controls()["paused"]:
                 return None
             self.remaining -= 1
-            self.rt["active_request"] = {"key": spec["key"], "started_at": utc_now().isoformat()}
-            self.save()
+            started = utc_now()
+            started_monotonic = time.monotonic()
+            self.rt["active_request"] = {
+                "schema": SOURCE_REQUEST_SCHEMA, "key": spec["key"], "started_at": started.isoformat(),
+                "permission_until": (started + pd.Timedelta(seconds=INFLIGHT_PERMISSION_SECONDS)).isoformat(),
+                "started_monotonic": started_monotonic,
+                "permission_monotonic_until": started_monotonic + INFLIGHT_PERMISSION_SECONDS,
+                **{key: self.rt.get(key) for key in ("pid", "created", "launch_id")}}
+            try:
+                self.save()
+            except BaseException:
+                self.rt["active_request"] = None
+                raise
+        # An exception inside send may follow dispatch or a response but precede
+        # durable evidence. Retain its intent until source-correct review rather
+        # than pretending a local exception proves the venue outcome.
         try:
             evidence = send(client, spec, self.budget["maximum_response_bytes"], self.raw)
-        finally:
-            self.rt["active_request"] = None
-        if evidence.get("raw_sha256"):
-            path = self.raw / f'{evidence["raw_sha256"]}.json'
-            if evidence["raw_sha256"] not in self.seen:
-                self.seen.add(evidence["raw_sha256"])
-                self.used += path.stat().st_size
+        except BaseException:
+            self.hold_source_outcome()
+            raise
+        self.hold_source_outcome()
+        status = evidence["status"]
+        if status not in {"RECEIVED", "RATE_LIMITED", "ACCESS_RESTRICTED", "RESPONSE_LIMIT",
+                          "HTTP_ERROR", "API_ERROR", "INVALID_RESPONSE", "TRANSPORT_ERROR"}:
+            raise ValueError("Unknown Phase 10 source-request outcome")
         row = {"request": spec, **evidence}
         self.rt["requests"] = self.rt.get("requests", 0) + 1
-        if evidence["status"] != "RECEIVED":
+        self.rt["last_request_result"] = {"key": spec["key"],
+                                          **{key: evidence.get(key) for key in
+                                             ("status", "http_status", "received_at", "raw_sha256")}}
+        if status != "RECEIVED":
             failures = self.rt.get("consecutive_errors", 0) + 1
             self.rt["consecutive_errors"] = failures
             self.rt["last_error"] = row
             wait = 3600 if evidence["status"] == "ACCESS_RESTRICTED" else min(900, 15 * 2**min(failures, 6))
             earliest = utc_now() + pd.Timedelta(seconds=wait)
-            self.rt["retry_at"] = max(earliest, utc(row.get("resume_after", earliest))).isoformat()
-            self.save()
-            return None
-        self.rt.update(retry_at=None, consecutive_errors=0)
-        return row
+            set_backoff(self.rt, evidence["status"], wait, scope="SHARED_KUCOIN_SOURCE",
+                        retry_at=max(earliest, utc(row.get("resume_after", earliest))), request_status=evidence["status"])
+        else:
+            self.rt.update(retry_at=None, backoff=None, source_backoff=None, consecutive_errors=0)
+        self.rt["active_request"] = None
+        self._known_source_result = True
+        # Commit the completed result before another request or shutdown can
+        # erase its intent. If publication fails, the old intent stays visible
+        # to consumers and blocks a new owner's automatic restart.
+        self.save()
+        if evidence.get("raw_sha256"):
+            path = self.raw / f'{evidence["raw_sha256"]}.json'
+            if evidence["raw_sha256"] not in self.seen:
+                size = research_io(path.stat).st_size
+                self.seen.add(evidence["raw_sha256"])
+                self.used += size
+        return row if status == "RECEIVED" else None
 
     def payload(self, evidence):
-        return load_payload(OUTPUT, evidence)
+        return research_io(load_payload, OUTPUT, evidence)
 
     def refresh_metadata(self, client, now):
         if self.rules.get("as_of") and now - utc(self.rules["as_of"]) < pd.Timedelta("23h"):
@@ -285,12 +572,12 @@ class Worker:
             if row is None:
                 return
             raw_path = self.raw / f'{row["raw_sha256"]}.json'
-            immutable_bytes(folder / "raw", raw_path.read_bytes(), "json")
-            write_json(folder / "attempts" / f"{number:02}.json", row)
-        rules = metadata(folder)
+            research_io(immutable_bytes, folder / "raw", research_io(raw_path.read_bytes), "json")
+            research_io(write_json, folder / "attempts" / f"{number:02}.json", row)
+        rules = research_io(metadata, folder)
         if rules["status"] == "OBSERVED":
+            research_io(runtime_snapshot.publish, STATE / "metadata.json", rules)
             self.rules = rules
-            write_json(STATE / "metadata.json", rules)
 
     def prices(self, client, name, close):
         mode = self.cfg["profiles"][name]
@@ -315,7 +602,7 @@ class Worker:
             cycle = {"profile": name, "at": utc_now().isoformat(), "due_boundary": close.isoformat(),
                      "last_close": frame.close_at.max().isoformat(), "source": fetched,
                      "launch_id": self.rt["launch_id"], "launcher": self.rt["launcher"]}
-            write_json(OUTPUT / "cycles" / f'{fingerprint(cycle)}.json', cycle)
+            research_io(write_json, OUTPUT / "cycles" / f'{fingerprint(cycle)}.json', cycle)
             self.rt["profiles"][name].update(checkpoint=cycle["last_close"], last_success=cycle["at"],
                                              last_receipt=source["received_at"], last_cycle=fingerprint(cycle))
             self.save()
@@ -340,7 +627,7 @@ class Worker:
         return OUTPUT / "decisions" / name / f"{key}.json"
 
     def mirror(self, row, path):
-        idea = publish(row["idea"], row["reference_id"]) if row["idea"] is not None else None
+        idea = research_io(publish, row["idea"], row["reference_id"]) if row["idea"] is not None else None
         if idea and idea["status"] == "CONDITIONAL":
             self.rt.setdefault("active", {})[idea["idea_id"]] = idea
         name = row["profile"]
@@ -357,8 +644,9 @@ class Worker:
         for name in NAMES:
             item = self.rt["profiles"][name]
             last = utc(item.get("boundary", "2000-01-01"))
-            paths = (OUTPUT / "decisions" / name).glob("*.json")
-            pending = [(read_json(path), path) for path in paths if path.stat().st_mtime >= last.timestamp()]
+            paths = research_io(list, (OUTPUT / "decisions" / name).glob("*.json"))
+            pending = [(research_io(read_json, path), path) for path in paths
+                       if research_io(path.stat).st_mtime >= last.timestamp()]
             for row, path in sorted(pending, key=lambda item: item[0]["boundary"]):
                 if utc(row["boundary"]) > last:
                     self.mirror(row, path)
@@ -366,8 +654,8 @@ class Worker:
     def record(self, name, close, quotes, flags):
         path = self.existing_decision(name, close)
         now = utc_now()
-        if path.exists():
-            row = read_json(path)
+        if research_io(path.exists):
+            row = research_io(read_json, path)
         else:
             arrival = timing(now, close)
             frame = self.frames[name]
@@ -399,7 +687,7 @@ class Worker:
                        strategy_version=self.policy["version"], source_receipt=ready_at,
                        model_readiness="MODEL_UNAVAILABLE_RULES_PINNED", launch_id=self.rt["launch_id"],
                        launcher=self.rt["launcher"], reference_id=self.ref_id)
-            write_json(path, row)
+            research_io(write_json, path, row)
         self.mirror(row, path)
         self.save()
 
@@ -409,6 +697,10 @@ class Worker:
         if not flags["monitor"]:
             for entry in self.rt["profiles"].values():
                 entry["waiting_reason"] = "MONITORING_OFF"
+            self.manage_active({}, now)
+            return
+        if self.rt.get("retry_at") and now < utc(self.rt["retry_at"]):
+            # Back off the research cycle itself, not just each HTTP request.
             self.manage_active({}, now)
             return
         self.remaining = MAX_REQUESTS_PER_CYCLE
@@ -468,7 +760,7 @@ class Worker:
             market = idea["market"] == "FUTURES"
             quote = quotes.get("perp-quote" if market else "spot-quote")
             mark = quotes.get("perp-mark") if market else None
-            if observe_idea(idea, quote, mark, now, self.policy):
+            if research_io(observe_idea, idea, quote, mark, now, self.policy):
                 del self.rt["active"][key]
 
 
@@ -566,7 +858,12 @@ def status():
         counts[value] += 1
     return {"execution_mode": MODE, "validation": APPROVAL, "runtime": runtime, "controls": flags,
             "identity": {key: rt.get(key) for key in ("pid", "created", "launcher", "launch_id", "started_at", "heartbeat")},
-            "last_error": runtime_error or rt.get("last_error"), "retry_at": rt.get("retry_at"), "raw_bytes": rt.get("raw_bytes", 0),
+            "last_error": runtime_error or rt.get("last_error"), "retry_at": rt.get("retry_at"),
+            "backoff": rt.get("backoff"), "source_backoff": rt.get("source_backoff"), "raw_bytes": rt.get("raw_bytes", 0),
+            "active_request": rt.get("active_request"), "last_request_result": rt.get("last_request_result"),
+            "loaded_worker_source_sha256": rt.get("worker_source_sha256"),
+            "loaded_snapshot_source_sha256": rt.get("snapshot_source_sha256"),
+            "disk_worker_source_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
             "raw_ceiling_bytes": MAX_RAW_BYTES, "profiles": view, "decision_counts": counts,
             "research": {**work_state(), "reason": probe.get("reason", "Finite source probe pending"),
                          "legacy_mode": legacy["mode"], "phase9_manual_gate": phase9_controls()["training"]}}
@@ -578,6 +875,7 @@ def run(managed=False):
     handler = RotatingFileHandler(OUTPUT / "worker.log", maxBytes=1024**2, backupCount=3, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     LOG.addHandler(handler)
+    worker = None
     try:
         with writer_lock(LOCK):
             activity = STATE / ".activity.lock"
@@ -590,10 +888,14 @@ def run(managed=False):
                 except CorruptRuntime as exc:
                     LOG.error("KuCoin worker start blocked: %s", exc)
                     raise
+                require_completed_request(rt)
+                validate_backoff(rt, at=now)
                 previous = rt.get("launch_id")
                 rt.update(pid=os.getpid(), created=psutil.Process().create_time(), launcher="scheduled" if managed else "local",
                           launch_id=uuid4().hex, started_at=now.isoformat(), previous_launch=previous, stopped_at=None,
-                          drain_guard_version=1, active_request=None, worker_stage="STARTING", phase13_observer=None)
+                          drain_guard_version=1, active_request=None, worker_stage="STARTING", phase13_observer=None,
+                          worker_source_sha256=LOADED_WORKER_SOURCE_SHA256,
+                          snapshot_source_sha256=LOADED_SNAPSHOT_SOURCE_SHA256)
                 rt.setdefault("profiles", {name: {} for name in NAMES})
                 worker = Worker(rt, reference(), parent_design())
                 worker.seen = {item.stem for item in worker.raw.glob("*.json")}
@@ -607,12 +909,12 @@ def run(managed=False):
                                 break
                             try:
                                 rt["worker_stage"] = "COLLECTING"
-                                worker.seed(utc_now())
-                                worker.cycle(client)
-                                worker.admit_research()
+                                if not (rt.get("retry_at") and utc_now() < utc(rt["retry_at"])):
+                                    worker.seed(utc_now())
+                                    worker.cycle(client)
+                                    worker.admit_research()
                             except (ValueError, KeyError, OSError, RuntimeError) as exc:
-                                rt["last_error"] = {"at": utc_now().isoformat(), "reason": str(exc)}
-                                rt["retry_at"] = (utc_now() + pd.Timedelta(seconds=30)).isoformat()
+                                record_cycle_failure(rt, exc)
                                 LOG.exception("KuCoin cycle failed")
                             try:
                                 if not controls()["paused"]:
@@ -620,7 +922,10 @@ def run(managed=False):
                             except (ValueError, KeyError, OSError, RuntimeError):
                                 LOG.exception("Phase 13 observation launch failed")
                             rt["worker_stage"] = "IDLE"
-                            worker.save()
+                            worker.save_or_defer()
+                        # A failed deletion of an older held snapshot cannot
+                        # retain the completed source-publication fence.
+                        runtime_snapshot.trim(RUNTIME, limit=128)
                         for _ in range(POLL_SECONDS):
                             if controls()["paused"]:
                                 break
@@ -640,6 +945,10 @@ def run(managed=False):
                     worker.save()
                 LOG.info("KuCoin worker stopped")
     finally:
+        # The worker lease has already exited. An unresolved durable intent is
+        # no longer allowed to claim a live managed owner after fence release.
+        if worker is not None:
+            worker.release_source_outcome()
         handler.close()
         LOG.removeHandler(handler)
 

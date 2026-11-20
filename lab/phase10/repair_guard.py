@@ -48,6 +48,13 @@ def _read(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _runtime(root):
+    from lab import runtime_snapshot
+
+    path = root / "data/phase10/runtime.json"
+    return runtime_snapshot.read(path, lambda: _read(path))
+
+
 def _save(path, value):
     temporary = path.with_name(f".{uuid4().hex}.tmp")
     try:
@@ -62,7 +69,7 @@ def _state(root, action, reason=None):
         control = _read(root / CONTROL)
         if type(control["paused"]) is not bool or type(control["monitor"]) is not bool:
             raise ValueError("Invalid KuCoin monitoring control")
-        runtime = _read(root / "data/phase10/runtime.json") if action != "status" else {}
+        runtime = _runtime(root) if action != "status" else {}
         old = _read(root / REPAIR) if (root / REPAIR).is_file() else {}
         if action in {"pause", "block", "resume"}:
             pause = action != "resume"
@@ -106,7 +113,7 @@ def quiescence(root, allow_worker=False):
         if _read(root / CONTROL)["paused"] is not True:
             raise ValueError("KuCoin must be paused during repair")
         if allow_worker:
-            runtime = _read(root / "data/phase10/runtime.json")
+            runtime = _runtime(root)
             if runtime.get("drain_guard_version") != 1 or not (root / ACTIVITY).is_file():
                 raise ValueError("Live worker has no verified activity guard")
             held.enter_context(_lease(root / ACTIVITY))
@@ -129,6 +136,10 @@ def main():
             sys.stdin.readline()
     elif action == "status" and not arguments:
         print(json.dumps(_update(ROOT, action)))
+    elif action == "runtime" and not arguments:
+        runtime = _runtime(ROOT)
+        print(json.dumps({key: runtime.get(key) for key in (
+            "pid", "created", "launch_id", "launcher", "drain_guard_version", "stopped_at")}))
     elif action in {"pause", "resume", "block", "started"} and len(arguments) <= 1:
         reason = sys.stdin.readline().strip() if arguments == ["--reason-stdin"] else (arguments[0] if arguments else None)
         print(json.dumps(_update(ROOT, action, reason)))

@@ -14,6 +14,8 @@ The scripts call the project’s explicit Python executable. On the current work
 
 Open [the local dashboard](http://127.0.0.1:8501). Press Ctrl+C in the launching terminal to stop a foreground instance. A second launch will encounter the existing listener if port 8501 is already in use.
 
+The [current PAPER runbook](PAPER_OPERATIONS_RUNBOOK.md) covers the seven managed accounts, their source and protection checks, and the generation-bound retirement and startup controls.
+
 To reproduce the environment in a fresh checkout, use Python 3.12 and install the pinned Windows x64 dependency set.
 
 ```powershell

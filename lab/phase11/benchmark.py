@@ -54,8 +54,8 @@ def jsonl_bytes(rows):
 
 def heartbeat():
     # Reading durable state does not require accessing another logon session.
-    from lab.phase10.worker import RUNTIME
-    runtime = read_json(RUNTIME)
+    from lab.phase10.worker import read_runtime
+    runtime = read_runtime()
     return {"at": utc_now().isoformat(), "heartbeat": runtime["heartbeat"], "pid": runtime["pid"],
             "launcher": runtime["launcher"], "day": runtime["profiles"]["day"]}
 

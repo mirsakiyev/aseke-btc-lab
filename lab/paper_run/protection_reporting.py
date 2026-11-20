@@ -83,6 +83,8 @@ def summarize(db, lane, book):
         reasons = []
         if body.get("provisional"):
             reasons.append("PROVISIONAL_CLOSE")
+        if body.get("funding_provisional"):
+            reasons.append("FUNDING_RECONCILIATION_PROVISIONAL")
         if body.get("operator_intervened") or body.get("exit_kind") == "OPERATOR_REQUESTED_PAPER_EXIT":
             reasons.append("OPERATOR_INTERVENED")
         if position_id in affected:
@@ -109,7 +111,8 @@ def summarize(db, lane, book):
     gains = sorted((record["net"] for record in validated if record["net"] > 0), reverse=True)
     all_nominal_nets = all(type(record.get("net")) in (int, float) and isfinite(record["net"]) for record in nominal)
     active = book.get("position") or {}
-    active_uncertainty = bool(active.get("unresolved_protection") or active.get("id") in affected)
+    active_uncertainty = bool(active.get("unresolved_protection") or active.get("funding_provisional")
+                              or active.get("id") in affected)
     excluded = len(nominal) - count
     return {
         "research_validation_policy": VERSION,

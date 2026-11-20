@@ -298,17 +298,28 @@ def test_worker_records_admitted_request_until_source_receipt(monkeypatch, tmp_p
     saved = []
     instance = SimpleNamespace(rt={}, remaining=1, used=0, raw=tmp_path,
                                budget={"maximum_response_bytes": 1, "minimum_spacing_seconds": 1})
-    instance.save = lambda: saved.append(instance.rt["active_request"].copy())
+    instance.hold_source_outcome = lambda: worker.Worker.hold_source_outcome(instance)
+
+    def save():
+        saved.append(instance.rt["active_request"].copy() if instance.rt["active_request"] else None)
+        if instance.rt["active_request"] is None:
+            worker.Worker.release_source_outcome(instance)
+
+    instance.save = save
     request = {"key": "perp-mark"}
 
     def source(*_):
-        assert saved == [{"key": "perp-mark", "started_at": clock.isoformat()}]
+        assert saved[0]["key"] == "perp-mark" and saved[0]["started_at"] == clock.isoformat()
+        assert saved[0]["schema"] == worker.SOURCE_REQUEST_SCHEMA
+        assert saved[0]["permission_until"] == (clock + pd.Timedelta(seconds=5)).isoformat()
         return {"status": "RECEIVED", "received_at": clock.isoformat()}
 
     monkeypatch.setattr(worker, "send", source)
     receipt = worker.Worker.fetch(instance, None, request)
     assert receipt["request"] == request
     assert instance.rt["active_request"] is None
+    assert len(saved) == 2 and saved[-1] is None
+    assert instance.rt["last_request_result"]["status"] == "RECEIVED"
 
 
 def test_observer_receipts_keep_only_operational_fields(tmp_path):

@@ -107,18 +107,23 @@ def _healthy(record, amendment, lane):
         raise ValueError("The current source is not qualified")
     if not runtime.synchronized(at):
         raise EvidenceUnavailable("WORKSTATION_CLOCK_SYNC_UNVERIFIED")
-    heartbeat = read_json(gate.ROOT / "last-cycle.json")
+    heartbeat = runtime.read_status_snapshot("last-cycle.json", {})
     if (heartbeat.get("state") != "RUNNING" or heartbeat.get("generation") != record["id"]
             or heartbeat.get("source_amendment_id") != amendment["id"]
             or type(heartbeat.get("pid")) is not int or heartbeat["pid"] <= 0
             or not heartbeat.get("runner_build_id")
             or not 0 <= (at - execution.stamp(heartbeat["at"])).total_seconds() < 45):
         raise EvidenceUnavailable("A fresh managed collector heartbeat is required")
-    stream = read_json(gate.ROOT / "ema-live-status.json")
+    stream = runtime.read_status_snapshot("ema-live-status.json", {})
     if (stream.get("state") != "STREAMING" or stream.get("amendment_id") != amendment["id"]
             or not 0 <= (at - execution.stamp(stream["at"])).total_seconds() < 45):
         raise EvidenceUnavailable("The authorized Kraken transport is not currently streaming")
     runtime.kraken_live.permission(at)
+    from lab.paper_run import delivery
+
+    with closing(runtime.connect(readonly=True)) as source:
+        if any(item["book_id"] == lane["book_id"] for item in delivery.pending_books(source)):
+            raise EvidenceUnavailable("Uncommitted reference work must be processed before an administrative exit")
     return heartbeat
 
 

@@ -2,7 +2,7 @@ from collections import Counter
 from math import sqrt
 from pathlib import Path
 
-from lab.phase10.worker import RUNTIME
+from lab.phase10.worker import read_runtime
 from lab.phase13.diagnostics import folder, progress
 from lab.phase13.future import technical
 from lab.phase13.observation import status as capture_status
@@ -21,7 +21,7 @@ def status():
     root = folder(ptr["id"]) if ptr else None
     completed = optional(root / "result.json") if root else None
     capture = capture_status()
-    live = optional(RUNTIME) or {}
+    live = read_runtime()
     launch = capture.get("last_managed_cycle", {}).get("launcher", "")
     capture["task_managed_extension_confirmed"] = launch == f"scheduled:{live.get('launch_id')}"
     capture["current_kucoin_worker"] = {key: live.get(key) for key in ("pid", "launcher", "launch_id", "heartbeat")}

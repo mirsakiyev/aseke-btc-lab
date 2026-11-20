@@ -1,8 +1,6 @@
 # Protection incident lifecycle and prospective recovery v1
 
-The implementation uses `PROTECTION_INCIDENT_POLICY_V1` for generation `caf235480b6362124546d17c9a77719572bc551c13b17da82d89374a007438e9`. The framework is installed in source and requires explicit policy activation in the current paper journal. Implementation and a read-only report do not activate it.
-
-The existing EMA Day position `95d7d033bdfbc27d29c4347d0949d24acb5fa5f5ea3f90f00cb69a245e365c3e` retains its protection uncertainty. Applying this framework to that position requires separate approval. The policy activation command requires all seven accounts flat and a managed runner that has adopted the reviewed implementation.
+The implementation uses `PROTECTION_INCIDENT_POLICY_V1`. Activation requires a matching adopted build and an authorization event in the current journal. Preserve prior uncertainty and review each incident using its original evidence.
 
 ## Lifecycle and evidence
 
@@ -29,10 +27,9 @@ The existing 45-second missing-reference threshold remains in force. A transport
 
 ## Read-only review
 
-Run from the active repository.
+Run from the verified, adopted runtime root.
 
 ```powershell
-Set-Location 'C:/Users/16477/Projects/aseke-btc-lab'
 & .\.venv\Scripts\python.exe -m lab.paper_run protection report --slot ema/day
 ```
 
@@ -46,7 +43,7 @@ Every operation uses a JSON request file with these common fields.
 
 ```json
 {
-  "generation": "caf235480b6362124546d17c9a77719572bc551c13b17da82d89374a007438e9",
+  "generation": "COPY_CURRENT_GENERATION",
   "slot": "ema/day",
   "review_token": "COPY_FROM_THE_LATEST_REPORT",
   "request_id": "UNIQUE_OPERATOR_REQUEST_ID",
@@ -72,7 +69,7 @@ A preview can reject unmet safety prerequisites. State changes require both `--a
 & .\.venv\Scripts\python.exe -m lab.paper_run protection resume --request .\resume-request.json --apply --approve
 ```
 
-These application examples describe the supported procedure. They do not authorize activation, adjudication or resume for the current open EMA Day position.
+Application requires the exact reviewed operation and scope.
 
 ### Activate
 
@@ -90,7 +87,7 @@ A no-crossing request can use the preserved native chart audit.
 
 ```json
 {
-  "generation": "caf235480b6362124546d17c9a77719572bc551c13b17da82d89374a007438e9",
+  "generation": "COPY_CURRENT_GENERATION",
   "slot": "ema/day",
   "review_token": "COPY_FROM_THE_LATEST_REPORT",
   "request_id": "UNIQUE_NO_CROSSING_REVIEW_ID",
@@ -98,16 +95,16 @@ A no-crossing request can use the preserved native chart audit.
   "incident_id": "COPY_THE_SELECTED_INCIDENT_ID",
   "evidence": {
     "outcome": "NO_EXIT_THRESHOLD_CROSSING_SUPPORTED",
-    "path": "C:/Users/16477/AppData/Local/ASEKE-BTC-Lab/protection-audit/ema-day-chart-audit-20261117T172713840614Z.json",
-    "sha256": "84ad5610a2c6733e7720c42b8e79bd5aefe62d28d2df1fa45c23e6b59663af6f",
+    "path": "ABSOLUTE_PATH_TO_REVIEWED_NATIVE_CHART_AUDIT",
+    "sha256": "SHA256_OF_EXACT_CHART_AUDIT_BYTES",
     "provenance": {
       "origin": "PRESERVED_NATIVE_KRAKEN_OHLC_AUDIT",
       "operator": "IDENTITY_OF_THE_EVIDENCE_REVIEWER",
-      "acquired_at": "2026-11-17T17:27:13.840614+00:00",
+      "acquired_at": "EXPLICIT_OFFSET_TIMESTAMP",
       "source": "KRAKEN_BTC_USD_LAST_TRADE",
       "symbol": "BTC/USD",
       "trigger_basis": "KRAKEN_BTC_USD_LAST_TRADE",
-      "stream_id": "b55f401582a344422ee7295df4b1a31d737094dd62a507a280e65b27e5faf5b7"
+      "stream_id": "COPY_APPROVED_STREAM_ID"
     }
   }
 }
@@ -119,7 +116,7 @@ An explicit insufficiency request has the same common fields and manifest struct
 
 ```json
 {
-  "generation": "caf235480b6362124546d17c9a77719572bc551c13b17da82d89374a007438e9",
+  "generation": "COPY_CURRENT_GENERATION",
   "slot": "ema/day",
   "review_token": "COPY_FROM_THE_LATEST_REPORT",
   "request_id": "UNIQUE_INSUFFICIENT_EVIDENCE_REVIEW_ID",
@@ -137,7 +134,7 @@ An explicit insufficiency request has the same common fields and manifest struct
       "source": "KRAKEN_BTC_USD_LAST_TRADE",
       "symbol": "BTC/USD",
       "trigger_basis": "KRAKEN_BTC_USD_LAST_TRADE",
-      "stream_id": "b55f401582a344422ee7295df4b1a31d737094dd62a507a280e65b27e5faf5b7"
+      "stream_id": "COPY_APPROVED_STREAM_ID"
     }
   }
 }
@@ -168,10 +165,49 @@ Fresh accepted forward observations continue protecting open positions regardles
 
 The reporting projection exposes nominal accounting separately from validated closed outcomes. It excludes provisional closes, incident-affected outcomes, incomplete outcome accounting and results dependent on unresolved capital. Operational resume does not promote those results. Analytical promotion is not implemented in this version, including after a no-threshold-crossing disposition.
 
-## Current historical incident
+[Incident projection](lab/paper_run/protection_incidents.py) · [Operator commands](lab/paper_run/protection_commands.py) · [Evidence validation](lab/paper_run/protection_evidence.py) · [Research classification](lab/paper_run/protection_reporting.py)
 
-The two originally audited November 17 stream discontinuities were recorded at 16:23:58.045 UTC and 17:02:10.432 UTC. The preserved 85-minute audit supports a limited no-crossing review through 17:25 UTC. The live predecessor runner recorded an additional discontinuity at 17:51:41.337 UTC during implementation, then resumed accepted observations. That incident lies outside the preserved audit and requires its own disposition. Missing first-recovery observations remain unknown. The current position's `unresolved_protection` flag is preserved.
+## Registered capabilities and source-correct review
 
-The framework, operator requests and reporting must be reviewed before activation against production. Testing occurs in isolated databases. Application commands take the existing writer lease and a single transaction, repeat exposure and evidence checks, and bind idempotency to both the operation and request. A crash rolls back the incomplete journal/state transition.
+Ongoing recovery now uses registered membership, including explicitly admitted future books. The original sealed seven-book registration and migration checks remain unchanged. A strategy name does not select a favorable evidence adapter: the admitted capability contract identifies the actual source, instrument, product, price basis, transport/subscription and source version. `protection report --slot SLOT` exposes that contract and the known historical stream IDs required to prepare evidence.
 
-[Incident projection](C:/Users/16477/Projects/aseke-btc-lab/lab/paper_run/protection_incidents.py) · [Operator commands](C:/Users/16477/Projects/aseke-btc-lab/lab/paper_run/protection_commands.py) · [Evidence validation](C:/Users/16477/Projects/aseke-btc-lab/lab/paper_run/protection_evidence.py) · [Research classification](C:/Users/16477/Projects/aseke-btc-lab/lab/paper_run/protection_reporting.py)
+| Actual protection reference | Supported evidence path | Important limit |
+|---|---|---|
+| Kraken BTC/USD last trade | Native same-market bounds, static or journal-derived effective segments; explicit insufficiency | Candles never establish complete continuous trade coverage |
+| KuCoin futures mark | Source-correct explicit insufficiency and operator review | Kraken trade candles cannot establish absence of a KuCoin mark-threshold crossing |
+| KuCoin Spot ticker last | Source-correct explicit insufficiency and operator review | Sampled reference points do not prove continuous coverage; Spot does not acquire a futures funding/liquidation obligation |
+
+A favorable finding requires the matching approved adapter. An unsupported adapter, missing model or missing interval produces an actionable review requirement, not a favorable fallback. A truthful `INSUFFICIENT_EVIDENCE` note may preserve unknown original interval endpoints and missing historical model fields. Its generation, book, position, source identity, recording time, hash and limitations must still match the review context. It does not invent an original detection time or recovery observation.
+
+Historical bare flags and provisional closes without a corresponding incident are projected as `UNATTRIBUTED_HISTORICAL_PROTECTION_FLAG`. The original detection and interval start remain null. A known terminal timestamp is labelled as a terminal receipt, not the beginning of the outage. The existing explicit import/adjudicate/resume path can preserve this uncertainty without creating an unexplained permanent dead end.
+
+Stop-only models retain `target=null`. Cash Spot has no recomputed futures liquidation threshold. `TRAIL_UPDATED`, `STOP_UPDATED`, `TRAILING_STOP_UPDATED` and funding cash flows are recognized at their actual effective journal times. A single latest stop is never applied retrospectively. Changing terms require `ASEKE_PROTECTION_SEGMENTED_CHART_AUDIT_V1`: each supplied interval, model and effective-event list must match the journal-derived segmentation. Native minute bounds that straddle a change are conservatively checked under both applicable models. This can require an `EXIT_IMPACT_POSSIBLE` disposition even when finer timing is unavailable. Unmodeled tiers or incomplete effective changes require explicit insufficiency or a separately reviewed terms adapter.
+
+## Per-book financial and permission checks
+
+Prospective resume remains scoped to the selected flat book. Other registered accounts may remain exposed and protected. The selected account must have unique matching `HYPOTHETICAL_FILL`, `EXIT_OBSERVED` and `CLOSED` evidence for every terminal position, correct insert ordering, finite cash flows, matching funding journal totals and reconciled nominal aggregates. Historical provisional/research exclusions do not themselves fail nominal reconciliation.
+
+Recovery work uses that same detailed terminal check whenever terminal or incident history exists. Every known incident position requires a matching genuine terminal `CLOSED` receipt; an empty financial journal and unchanged balance cannot establish that a previously exposed position reconciled. `WAIT_FINANCIAL_RECONCILIATION` records the exact missing or inconsistent evidence. Historical `accounting_complete=false` is not a financial input to this check, so a properly reconciled provisional result can proceed to explicit historical review without becoming validated research.
+
+`UNMODELED_TIER` has a distinct `UNSUPPORTED_FINANCIAL_MODEL_REVIEW_REQUIRED` path once the affected book is flat. While exposed, accepted-price protection and legitimate exits remain the priority. The restriction requires a separately reviewed instrument/tier/cost model and genuine financial receipts; a fresh quote, technical rearm, favorable chart finding or ordinary incident resume cannot resolve it. This release provides no model-substitution or financial-write approval for that path. Preserve the restriction and evidence until a separate supported resolution is reviewed and implemented; never insert a fictitious cost, reset capital or classify the limitation as a favorable absence of exit impact.
+
+Every permission is checked against its immutable authorization. A later historical protection cause, newly imported incident, changed incident disposition, unmodeled tier, historical operational fault or new provisional close revokes an old projection. An ordinary current clock/source restriction suspends actual entry through current gates; it does not erase a valid historical permission. A clean capital-dependent close also does not erase that permission. A permanent block still refuses admission.
+
+A missing legacy `problem` projection does not establish clean history. Read-only status and admission restoration conservatively derive the historical restriction from retained incident events, unexplained provisional closes or an unresolved position flag, without altering the original journal or balances. Current operational availability, nominal finances, historical coverage and research validation remain separate fields.
+
+## Durable bounded recovery work
+
+`recovery_work` records the current assessment and `recovery_work_event` retains its append-only audit. Work identity binds generation, registered book, capability contract, incident IDs and the operational episode when supplied. A new incident creates a new scope and supersedes unfinished older work. Evidence acquisition, evidence assessment, disposition and permission remain distinct stages. Staging an evidence manifest or receiving fresh prices grants no financial permission.
+
+The runner may reassess transient technical guards and request source evidence through existing authorized acquisition and resource limits. Acquisition is bounded to twenty attempts per work item, with exponential delay from fifteen seconds to five minutes. Evidence manifests and assessments are limited to thirty-two each. An exhausted item requires explicit technical review and rearm. Rearm preserves all source permissions and freshness checks and never adjudicates an incident, clears a position flag or grants a prospective resume.
+
+```powershell
+& .\.venv\Scripts\python.exe -m lab.paper_run.recovery policy
+& .\.venv\Scripts\python.exe -m lab.paper_run.recovery status --book $bookId
+& .\.venv\Scripts\python.exe -m lab.paper_run.recovery rearm --request $rearmRequest
+& .\.venv\Scripts\python.exe -m lab.paper_run.recovery rearm --request $rearmRequest --apply --approve
+```
+
+A rearm request contains exactly `generation`, `book_id`, `work_id`, `request_id` and `reason`. Its immutable request identity is idempotent; changed arguments under the same ID are refused. It operates under the existing writer lease and transaction. Read-only work status does not create missing tables.
+
+`AUTO_RESUME_POLICY_V1_DRAFT` is a disabled review proposal in this release. No blanket automatic historical approval or policy activation occurs. Its proposed permitted outcome is source-admitted `NO_EXIT_THRESHOLD_CROSSING_SUPPORTED`, together with flat/no-pending exposure, genuine terminal reconciliation, every relevant incident disposed, qualified current source/clock/reference/runner checks, no intentional pause or independent risk restriction, and a strictly future boundary. Insufficient evidence, ambiguous exit impact, unsupported capabilities, active protection loss and unreconciled finances retain their operator-review path. Commissioning any automatic policy requires a separate explicit versioned review and implementation/activation action; this release has no automatic-policy activation command.

@@ -13,7 +13,7 @@ from uuid import uuid4
 import pandas as pd
 
 from lab.config import fingerprint
-from lab.paper_run import archive, ema, gate, kraken_live, runtime, source_amendment
+from lab.paper_run import archive, ema, fresh_reset, gate, kraken_live, runtime, source_amendment
 from lab.storage import file_hash, read_json, utc, utc_now, write_json, writer_lock
 
 
@@ -108,6 +108,8 @@ def cutover(archive_parent=ARCHIVE_PARENT, preflight=None):
             not gate.retired() and utc_now()-utc(previous["generation"]["registered_at"]) > PREFLIGHT_AGE)):
         qualification = _preflight(preflight)
     with archive.cutover_locks():
+        if gate.reset_pending():
+            raise ValueError("Resume the pending generation reset before cutover")
         archived = archive.create_locked(archive_parent)
         current = runtime.current()
         if not current:
@@ -136,7 +138,7 @@ def entries_off():
     """Pause current entries while keeping the protection runner active."""
     with writer_lock(gate.ROOT / ".writer.lock"):
         record = runtime.current()
-        if not record:
+        if not record or gate.reset_pending():
             raise ValueError("No current paper generation to pause")
         path = gate.ROOT / "entries-paused"
         if not path.exists():
@@ -146,7 +148,7 @@ def entries_off():
 
 def _entry_pause(generation, now):
     record = runtime.current()
-    if not record or record["id"] != generation:
+    if not record or record["id"] != generation or gate.reset_pending():
         raise ValueError("The requested generation does not match the current paper generation")
     path = gate.ROOT / "entries-paused"
     if path.is_symlink():
@@ -163,23 +165,40 @@ def _entry_pause(generation, now):
     return path, raw, marker
 
 
-def entries_on(generation, *, approve=False):
+def _expected_entry_pause(raw, expected_pause_sha256):
+    digest = sha256(raw).hexdigest() if raw is not None else None
+    if expected_pause_sha256 is not None and expected_pause_sha256 != digest:
+        raise ValueError("The current entry pause does not match the approved SHA-256")
+    return digest
+
+
+def entries_on(generation, *, approve=False, expected_pause_sha256=None):
     """Preview release of the current entry pause; approval records authority before release."""
     now = utc_now()
     path, raw, marker = _entry_pause(generation, now)
+    digest = _expected_entry_pause(raw, expected_pause_sha256)
     if approve is not True:
         return {"state": "ENTRY_RESUME_PREVIEW", "generation": generation,
                 "paused": raw is not None, "requires_explicit_operator_approval": True,
-                "pause_marker": marker, "pause_sha256": sha256(raw).hexdigest() if raw is not None else None}
+                "pause_marker": marker, "pause_sha256": digest}
     with writer_lock(gate.ROOT / ".writer.lock"):
         now = utc_now()
         path, raw, marker = _entry_pause(generation, now)
+        digest = _expected_entry_pause(raw, expected_pause_sha256)
         if raw is None:
             return {"state": "CURRENT_ENTRIES_ALREADY_ENABLED", "generation": generation}
+        reset_intent = gate.reset_intent()
+        if reset_intent and reset_intent["successor"] == generation:
+            from lab.paper_run import protection_incidents
+
+            with closing(runtime.connect(readonly=True)) as db:
+                policy = protection_incidents.active(db)
+            if not policy or policy["generation"] != generation:
+                raise ValueError("Activate the current generation's protection policy before enabling entries")
         identifier = uuid4().hex
         authorization = {"schema": "CURRENT_ENTRY_CONTROL_AUTHORIZATION_V1", "id": identifier,
                          "generation": generation, "action": "ENTRIES_ON", "operator": getpass.getuser(),
-                         "authorized_at": now.isoformat(), "pause_sha256": sha256(raw).hexdigest(),
+                         "authorized_at": now.isoformat(), "pause_sha256": digest,
                          "pause_marker": marker}
         folder = gate.ROOT / "entries-controls"
         folder.mkdir(parents=True, exist_ok=True)
@@ -196,12 +215,9 @@ def entries_on(generation, *, approve=False):
                 "authorization_path": str(saved), "authorization_sha256": sha256(encoded).hexdigest()}
 
 
-def amend_ema_source(path):
-    record = runtime.current()
-    if not record:
-        raise ValueError("No current generation to amend")
-    if prior := source_amendment.active(record):
-        return prior
+def _kraken_qualification(path, *, max_age=None):
+    if path is None:
+        raise ValueError("Supply a current Kraken measurement to prepare a new generation")
     digest = file_hash(path)
     report = read_json(path)
     if file_hash(path) != digest:
@@ -212,6 +228,7 @@ def amend_ema_source(path):
     ready = report.get("age_at_decision_readiness_seconds") or {}
     if (report["endpoint"] != source_amendment.ENDPOINT or report["source"] != ema.SOURCE or report["symbol"] != ema.SYMBOL
             or not utc(report["started_at"]) < utc(report["ended_at"]) <= now
+            or (max_age is not None and now - utc(report["ended_at"]) > max_age)
             or not 120 <= report["duration_seconds"] <= 301 or not report["forced_reconnect_requested"]
             or counts.get("subscriptions_acknowledged", 0) < 2 or counts.get("queue_dropped", 0)
             or not ready.get("count") or not 0 <= ready["max"] <= 2
@@ -220,19 +237,38 @@ def amend_ema_source(path):
     if not runtime.synchronized(now):
         raise ValueError("Workstation clock synchronization could not be verified")
     kraken_live.permission(now)
-    qualification = {"state": "QUALIFIED", "reason": None, "qualified_at": now.isoformat(),
-                     "measurement_sha256": digest, "measurement": report}
+    return {"state": "QUALIFIED", "reason": None, "qualified_at": now.isoformat(),
+            "measurement_sha256": digest, "measurement": report}
+
+
+def amend_ema_source(path):
+    record = runtime.current()
+    if not record:
+        raise ValueError("No current generation to amend")
+    if prior := source_amendment.active(record):
+        return prior
+    qualification = _kraken_qualification(path)
+    now = utc(qualification["qualified_at"])
     return source_amendment.install(record, qualification, now=now)
+
+
+def reset(generation, archive_parent, measurement):
+    def qualify():
+        qualifications = runtime.probe()
+        return qualifications, _kraken_qualification(measurement, max_age=PREFLIGHT_AGE)
+
+    return fresh_reset.reset(generation, archive_parent, qualify)
 
 
 def main():
     parser = argparse.ArgumentParser(prog="python -m lab.paper_run")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "run"):
-        commands.add_parser(name)
+    commands.add_parser("status")
+    commands.add_parser("run")
     entries = commands.add_parser("entries")
     entries.add_argument("state", choices=("off", "on"))
     entries.add_argument("--generation", help="Exact current generation required for entries on")
+    entries.add_argument("--expected-pause-sha256", help="Refuse to release a different pause marker")
     entries.add_argument("--approve", action="store_true", help="Explicitly approve releasing the current entry pause")
     commands.add_parser("probe").add_argument("--save", type=Path)
     operator_close = commands.add_parser("operator-close", help="Preview a targeted administrative paper exit")
@@ -244,6 +280,12 @@ def main():
     transition = commands.add_parser("cutover")
     transition.add_argument("--archive-parent", type=Path, default=ARCHIVE_PARENT)
     transition.add_argument("--preflight", type=Path)
+    commands.add_parser("stop", help="Stop and fence the exact current generation's runner").add_argument(
+        "--generation", required=True)
+    fresh = commands.add_parser("reset", help="Archive the stopped generation and initialize a paused successor")
+    fresh.add_argument("--generation", required=True)
+    fresh.add_argument("--archive-parent", type=Path, default=ARCHIVE_PARENT)
+    fresh.add_argument("--kraken-measurement", type=Path, help="A fresh reconnect measurement, required for the first attempt")
     protection = commands.add_parser("protection")
     operations = protection.add_subparsers(dest="operation", required=True)
     operations.add_parser("report").add_argument("--slot", required=True)
@@ -264,9 +306,12 @@ def main():
         "operator-close": lambda: operator_close_action(args),
         "probe": lambda: probe(args.save),
         "amend-ema-source": lambda: amend_ema_source(args.measurement),
-        "entries": lambda: entries_off() if args.state == "off" else entries_on(args.generation, approve=args.approve),
+        "entries": lambda: entries_off() if args.state == "off" else entries_on(
+            args.generation, approve=args.approve, expected_pause_sha256=args.expected_pause_sha256),
         "verify-archive": lambda: archive.verify(args.path),
         "cutover": lambda: cutover(args.archive_parent, args.preflight),
+        "stop": lambda: fresh_reset.request_stop(args.generation),
+        "reset": lambda: reset(args.generation, args.archive_parent, args.kraken_measurement),
         "protection": lambda: protection_action(args),
     }
     try:

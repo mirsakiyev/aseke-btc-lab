@@ -155,6 +155,8 @@ def panel(*, family=None):
         st.info("The legacy runs are retired. Successor account initialization is pending.")
     if archive := view.get("archive"):
         with st.expander("Archived paper history"):
-            st.write("Legacy delayed-price simulations are excluded from current performance.")
             st.code(str(archive), language=None)
-            st.caption(f"Cutoff {view['cutoff']} · Retirement audit {view['retirement_id']}")
+            if generation := view.get("retired_generation"):
+                st.caption(f"Cutoff {view['cutoff']} · Administratively discontinued generation {generation}")
+            else:
+                st.caption(f"Cutoff {view['cutoff']} · Retirement audit {view['retirement_id']}")

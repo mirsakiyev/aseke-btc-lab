@@ -78,6 +78,10 @@ function Stop-Process { throw 'LEGACY_PROCESS_CMDLET_CALLED' }
 function Get-ScheduledTask { throw 'SCHEDULER_ACCESS' }
 function Set-ScheduledTask { throw 'SCHEDULER_ACCESS' }
 function Start-ScheduledTask { throw 'SCHEDULER_ACCESS' }
+function Invoke-RepairGuard([string]$Action) {
+    if ($Action -ne 'runtime') { throw 'UNEXPECTED_REPAIR_GUARD_ACTION' }
+    Get-Content -Raw -LiteralPath (Join-Path $runtimeDir 'runtime.json') | ConvertFrom-Json
+}
 function Open-RepairProcessHandle([int]$ProcessId) {
     if ($ProcessId -ne $expected.ProcessId) { throw 'UNEXPECTED_HANDLE_REQUEST' }
     if ($case -eq 'handle-denied') { throw 'HANDLE_DENIED' }
@@ -167,6 +171,21 @@ switch ($case) {
     }
     'verified-task-owner' {
         if ($failure -or $priorities -or $terminations) { throw "Owner validation failed: $failure" }
+    }
+    'runtime-reuse' {
+        if ($failure -notmatch 'creation time differs' -or $priorities -or $terminations) {
+            throw "Reused runtime identity did not trigger its guard: $failure"
+        }
+    }
+    'runtime-changed' {
+        if ($failure -notmatch 'ownership record changed' -or $priorities -or $terminations) {
+            throw "Changed runtime did not trigger its guard: $failure"
+        }
+    }
+    'wrong-task-engine' {
+        if ($failure -notmatch 'outside the registered task process tree' -or $priorities -or $terminations) {
+            throw "Wrong task engine did not trigger its guard: $failure"
+        }
     }
     'stop-normal' {
         if ($failure -or $terminations -ne 1 -or $priorities -ne 0 -or $script:waits -ne 1 -or $script:disposed -ne 1) {

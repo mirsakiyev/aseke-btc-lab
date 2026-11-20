@@ -249,7 +249,7 @@ function Get-KuCoinTaskEngineId {
 }
 
 function Get-KuCoinRepairOwner($Runtime, [string[]]$PythonPaths) {
-    $currentRuntime = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'data\phase10\runtime.json') -Raw | ConvertFrom-Json
+    $currentRuntime = Invoke-RepairGuard 'runtime'
     if ($currentRuntime.pid -ne $Runtime.pid -or $currentRuntime.created -ne $Runtime.created -or
             $currentRuntime.launcher -ne 'scheduled' -or $currentRuntime.launch_id -cne $Runtime.launch_id) {
         throw 'The scheduled KuCoin ownership record changed.'
@@ -470,7 +470,7 @@ function Repair-LabObserver {
     Assert-Phase15Flat
     $task = Read-LabTask
     if (-not $task -or $task.State -notin @('Running','Ready')) { throw 'Expected the registered KuCoin task to be Running or Ready.' }
-    $runtime = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'data\phase10\runtime.json') -Raw | ConvertFrom-Json
+    $runtime = Invoke-RepairGuard 'runtime'
     if ($runtime.launcher -ne 'scheduled' -or $runtime.launch_id -cnotmatch '^[0-9a-f]{32}$') {
         throw 'Cannot identify the current scheduled KuCoin worker.'
     }

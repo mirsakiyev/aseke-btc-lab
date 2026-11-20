@@ -12,6 +12,7 @@ import pytest
 
 from lab.ema_paper.private_notifications import ROUTE_META
 from lab.health import delivery, fresh_paper_health as monitor, state
+from lab.paper_run import gate
 from lab.storage import utc
 
 
@@ -22,6 +23,7 @@ ROUTE = "a" * 64
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "ROOT", tmp_path / "health")
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "paper")
     source = sqlite3.connect(":memory:")
     source.executescript("CREATE TABLE book(id TEXT PRIMARY KEY,state TEXT);"
                          "CREATE TABLE event(key TEXT PRIMARY KEY,book TEXT,kind TEXT,idea TEXT,"
@@ -102,11 +104,13 @@ def test_changed_reason_and_distinct_incident_alert_while_already_blocked(world)
     world.view["books"]["ema/day"]["reason"] = "WORKSTATION_CLOCK_SYNC_UNVERIFIED"
     save_book(world, "ema/day")
     scan(world)
-    event(world, "PROTECTION_INCIDENT_OPENED", incident_id="new-incident", reason="KRAKEN_STREAM_DISCONTINUITY")
+    event(world, "PROTECTION_INCIDENT_OPENED", incident_id="new-incident", reason="KRAKEN_STREAM_DISCONTINUITY",
+          source_correlation_id="shared-source-episode")
     scan(world)
     assert len(alerts()) == 3
     assert "WORKSTATION_CLOCK_SYNC_UNVERIFIED" in alerts()[1]["text"]
     assert "new-incident" in alerts()[2]["text"]
+    assert json.loads(alerts()[2]["event_json"])["operational_event"]["source_correlation_id"] == "shared-source-episode"
     event(world, "PROTECTION_INCIDENT_OPENED", incident_id="new-incident", reason="duplicate same incident")
     scan(world)
     assert len(alerts()) == 3
@@ -364,6 +368,8 @@ def test_membership_adapter_discovers_committed_eighth_registration_after_startu
 
     module.lanes = lanes
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    import lab.paper_run as paper_package
+    monkeypatch.setattr(paper_package, "membership", module, raising=False)
     book = add_book(world, "mean_reversion/eighth", blocked="SOURCE_RESTRICTED")
     lane = world.record["body"]["lanes"].pop("mean_reversion/eighth")
     world.source.execute("INSERT INTO event VALUES(?,?,?,?,?,?,?)", (
@@ -426,6 +432,44 @@ def test_ordinary_operational_clear_does_not_require_historical_resume(world):
     event(world, "OPERATIONAL_BLOCK_CLEARED", episode_id="clock-episode", reason_code="CLOCK_UNVERIFIED")
     assert scan(world)["books"]["ema/day"]["entry_available"]
     assert any("ELIGIBILITY RESTORED" in row["text"] for row in alerts())
+
+
+def test_ephemeral_technical_entry_failure_uses_authoritative_operational_events(world):
+    book = world.view["books"]["ema/day"]
+    book.update(state="ACTIVE", problem=None, reason=None, historical_problem=None, prospective_entry_permission=True)
+    save_book(world, "ema/day")
+    scan(world)
+    assert not alerts()
+    event(world, "OPERATIONAL_BLOCK_OPENED", episode_id="technical-entry", reason_code="PRICE_SOURCE_UNAVAILABLE",
+          source_scope_id="one-source", correlation_id="one-correlation", requires_incident_review=False,
+          historical_coverage="NOT_APPLICABLE", restriction_started_at=NOW.isoformat())
+    event(world, "ENTRY_EVIDENCE_REJECTED", reason="MISSING_REFERENCE")
+    event(world, "NO_FILL", reason="PRICE_SOURCE_UNAVAILABLE")
+    event(world, "OPERATIONAL_BLOCK_CLEARED", episode_id="technical-entry", reason_code="PRICE_SOURCE_UNAVAILABLE",
+          source_scope_id="one-source", correlation_id="one-correlation", requires_incident_review=False,
+          historical_coverage="NOT_APPLICABLE", cleared_at=NOW.isoformat())
+    result = scan(world)
+    assert result["books"]["ema/day"]["entry_available"]
+    rows = alerts()
+    assert len(rows) == 2
+    assert "PAPER BOOK BLOCKED" in rows[0]["text"] and "ELIGIBILITY RESTORED" in rows[1]["text"]
+    cause = json.loads(rows[0]["event_json"])["operational_event"]
+    assert cause["episode_id"] == "technical-entry" and cause["source_scope_id"] == "one-source"
+    assert cause["correlation_id"] == "one-correlation" and cause["requires_incident_review"] is False
+    assert not any("PROTECTION INCIDENT" in row["text"] for row in rows)
+
+
+def test_normal_entry_recipe_rejection_and_no_trade_are_not_operational_incidents(world):
+    book = world.view["books"]["ema/day"]
+    book.update(state="ACTIVE", problem=None, reason=None, historical_problem=None, prospective_entry_permission=True)
+    save_book(world, "ema/day")
+    scan(world)
+    event(world, "ENTRY_EVIDENCE_REJECTED", reason="REFERENCE_HAS_NOT_REACHED_TRIGGER")
+    event(world, "NO_FILL", reason="REFERENCE_OUTSIDE_FROZEN_RANGE")
+    event(world, "EXPIRED", reason="ENTRY_WINDOW_ELAPSED")
+    book["last_evaluation"] = {"state": "EVALUATED", "signal": {"decision": "NO_TRADE"}}
+    result = scan(world)
+    assert result["books"]["ema/day"]["entry_available"] and not alerts()
 
 
 def test_historical_operational_clear_cannot_reuse_an_old_resume(world):

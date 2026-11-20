@@ -2,6 +2,7 @@ from contextlib import closing
 from copy import deepcopy
 from dataclasses import asdict
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -50,6 +51,15 @@ def generation(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "utc_now", lambda: now[0])
     monkeypatch.setattr(execution, "time", SimpleNamespace(monotonic_ns=lambda: mono(now[0])))
     monkeypatch.setattr(runtime, "synchronized", lambda _: True)
+    monkeypatch.setattr(runtime.kraken_live, "permission", lambda _: None)
+    optional = runtime.monitoring.optional
+
+    def producer_evidence(path, default=None):
+        if Path(path) == gate.ROOT / "ema-live-status.json" and not Path(path).exists():
+            return {"state": "STREAMING", "at": now[0].isoformat()}
+        return optional(path, default)
+
+    monkeypatch.setattr(runtime.monitoring, "optional", producer_evidence)
     return record, now
 
 
@@ -91,6 +101,22 @@ def history(lane, kind):
 def saved_book(lane):
     with closing(runtime.connect(readonly=True)) as db:
         return paper.load(db, lane)
+
+
+@pytest.mark.parametrize("scope", ("old_generation", "old_amendment", "reset_pending"))
+def test_stream_rejects_obsolete_generation_before_opening_the_ledger(generation, monkeypatch, scope):
+    record, now = generation
+    amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
+    if scope == "old_generation":
+        record = {**record, "id": "a" * 64}
+    elif scope == "old_amendment":
+        amendment = deepcopy(amendment)
+        amendment["body"]["generation"] = "a" * 64
+    else:
+        monkeypatch.setattr(gate, "reset_pending", lambda: True)
+    monkeypatch.setattr(runtime, "connect", lambda **kwargs: pytest.fail("Obsolete stream opened the financial DB"))
+    with pytest.raises(ValueError, match="paper generation"):
+        runtime.live_prices(record, amendment, [live_point(91)], {"state": "STREAMING", "at": stamp(now[0])})
 
 
 def test_source_amendment_is_future_only_and_preserves_every_account_and_horizon(generation):

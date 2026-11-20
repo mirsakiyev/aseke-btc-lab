@@ -15,6 +15,7 @@ from lab.learning.simulator import Contract, liquidation_price
 
 SCHEMA = "PROTECTION_EVIDENCE_REVIEW_V1"
 CHART_SCHEMA = "ASEKE_EMA_PROTECTION_CHART_AUDIT_V1"
+SEGMENTED_SCHEMA = "ASEKE_PROTECTION_SEGMENTED_CHART_AUDIT_V1"
 SOURCE = "KRAKEN_BTC_USD_LAST_TRADE"
 OUTCOMES = {
     "COVERAGE_VERIFIED", "NO_EXIT_THRESHOLD_CROSSING_SUPPORTED",
@@ -49,7 +50,8 @@ def _model(position):
         raise ValueError("Invalid frozen reference fee")
     return {
         "entry": entry, "side": side, "entry_at": _stamp(position["entry_at"]).isoformat(),
-        "stop": _number(position["stop"]), "target": _number(position["target"]),
+        "stop": _number(position["stop"]),
+        "target": _number(position["target"]) if position.get("target") is not None else None,
         "deadline": _stamp(position["deadline"]).isoformat(), "quantity_remaining": quantity,
         "reserved_margin": margin, "taker_fee": fee, "contract": plan["contract"],
         "liquidation_recomputed": (liquidation_price(entry, margin / quantity, side, contract, fee)
@@ -64,7 +66,7 @@ def _frozen_model(document, context, left, right):
     model = _model(position)
     if _stamp(model["entry_at"]) > left:
         raise ValueError("Reviewed interval begins before the position existed")
-    if (position.get("stop_effective_at") or position.get("prior_stop") or position.get("last_trail")
+    if not context.get("segmented_terms_verified") and (position.get("stop_effective_at") or position.get("prior_stop") or position.get("last_trail")
             or position.get("settled_funding") or position.get("unresolved_costs")
             or position["position"].get("funding", 0) or position.get("unresolved_tier")):
         raise ValueError("Changing stops, financing or terms require a segmented evidence review")
@@ -163,15 +165,47 @@ def _chart_review(document, context, left, right):
                 bounds.append((numbers["low"], numbers["high"]))
     low, high = min(row[0] for row in bounds), max(row[1] for row in bounds)
     stop, target, liquidation = model["stop"], model["target"], model["liquidation_recomputed"]
-    crossed = (high >= stop or low <= target or liquidation is not None and high >= liquidation
+    crossed = (high >= stop or target is not None and low <= target or liquidation is not None and high >= liquidation
                if model["side"] == -1 else
-               low <= stop or high >= target or liquidation is not None and low <= liquidation)
+               low <= stop or target is not None and high >= target or liquidation is not None and low <= liquidation)
     time_exit_possible = _stamp(model["deadline"]) < right
     if model["quantity_remaining"] * high > model["contract"]["tier_notional"]:
         raise ValueError("Candle evidence exceeds the frozen instrument tier")
     return {"candle_count": len(rows), "minimum_low": low, "maximum_high": high,
             "threshold_crossing_possible": crossed or time_exit_possible, "time_exit_possible": time_exit_possible,
             "frozen_model": model,
+            "native_receipts_reconciled": True, "full_trade_stream_coverage_verified": False}
+
+
+def _segmented_review(document, context, left, right):
+    """Reconcile every effective interval against journal-derived terms.
+
+    A minute straddling a stop change is conservatively tested against both
+    applicable models. This may require a possible-impact disposition; it
+    cannot turn coarse candle evidence into favorable sub-minute proof.
+    """
+    expected = context.get("terms_segments") or []
+    supplied = document.get("segments") or []
+    if not expected or len(supplied) != len(expected):
+        raise ValueError("Segmented evidence must cover every journal-derived effective interval")
+    if _stamp(expected[0]["start"]) != left or _stamp(expected[-1]["end"]) != right:
+        raise ValueError("Effective term segments do not cover the entire reviewed interval")
+    checks, previous = [], left
+    for actual, frozen in zip(supplied, expected):
+        start, end = _stamp(frozen["start"]), _stamp(frozen["end"])
+        if (start != previous or not start < end or _stamp(actual["interval_start"]) != start
+                or _stamp(actual["interval_end"]) != end
+                or actual.get("effective_event_ids", []) != frozen.get("effective_event_ids", [])):
+            raise ValueError("Evidence effective intervals or event provenance differ from the journal")
+        inner = {**context, "position": frozen["position"], "segmented_terms_verified": True}
+        chart = {**document, **actual, "schema": CHART_SCHEMA}
+        result = _chart_review(chart, inner, start, end)
+        checks.append({"start": start.isoformat(), "end": end.isoformat(),
+                       "effective_event_ids": frozen.get("effective_event_ids", []), **result})
+        previous = end
+    return {"effective_segments": checks,
+            "threshold_crossing_possible": any(item["threshold_crossing_possible"] for item in checks),
+            "time_exit_possible": any(item["time_exit_possible"] for item in checks),
             "native_receipts_reconciled": True, "full_trade_stream_coverage_verified": False}
 
 
@@ -194,11 +228,16 @@ def validate_evidence(manifest, context):
         reviewed_at = _stamp(context.get("reviewed_at", pd.Timestamp.now(tz="UTC")))
         if _stamp(provenance["acquired_at"]) > reviewed_at:
             raise ValueError("Acquisition provenance is future dated")
-        for key, expected in (("source", SOURCE), ("symbol", "BTC/USD"), ("trigger_basis", SOURCE)):
-            if context[key] != expected or provenance.get(key) != expected:
+        for key in ("source", "symbol", "trigger_basis"):
+            expected = context[key]
+            if not isinstance(expected, str) or not expected or provenance.get(key) != expected:
                 raise ValueError("Evidence does not match the approved instrument and trigger basis")
         if provenance.get("stream_id") != context["stream_id"]:
             raise ValueError("Evidence provenance has a different authorized source stream")
+        identity = context.get("source_identity")
+        if identity and (context["source"] != SOURCE or provenance.get("source_identity") is not None):
+            if provenance.get("source_identity") != identity:
+                raise ValueError("Evidence provenance has a different complete source identity")
         supplied_path = Path(manifest["path"])
         path = supplied_path.resolve()
         if supplied_path.is_symlink() or path.stat().st_size > MAX_ARTIFACT_BYTES:
@@ -211,13 +250,31 @@ def validate_evidence(manifest, context):
         for key in ("generation", "book_id", "position_id"):
             if document[key] != context[key]:
                 raise ValueError(f"Evidence has a different {key}")
-        left, right = _stamp(context["interval_start"]), _stamp(context["interval_end"])
-        if left >= right:
+        left = _stamp(context["interval_start"]) if context.get("interval_start") else None
+        right = _stamp(context["interval_end"]) if context.get("interval_end") else None
+        if left is not None and right is not None and left >= right:
             raise ValueError("An explicit nonempty reviewed interval is required")
-        if not right <= _stamp(document["recorded_at"]) <= reviewed_at:
+        if left is not None and left > reviewed_at:
+            raise ValueError("The historical interval is future dated")
+        if (not _stamp(document["recorded_at"]) <= reviewed_at
+                or right is not None and _stamp(document["recorded_at"]) < right):
             raise ValueError("Evidence recording time is outside the interval and review bounds")
+        if (left is None or right is None) and outcome != "INSUFFICIENT_EVIDENCE":
+            raise ValueError("Unknown historical intervals permit only explicit insufficiency")
         checks = {}
-        if document.get("schema") == CHART_SCHEMA:
+        adapter = context.get("evidence_adapter", "kraken_native_trade_bounds_v1" if context["source"] == SOURCE else
+                              "explicit_insufficiency_v1")
+        if document.get("schema") in (CHART_SCHEMA, SEGMENTED_SCHEMA):
+            if left is None or right is None:
+                raise ValueError("A candle review cannot invent an unknown historical interval")
+            if (adapter != "kraken_native_trade_bounds_v1" or context["source"] != SOURCE
+                    or context["symbol"] != "BTC/USD" or context["trigger_basis"] != SOURCE):
+                raise ValueError("No approved favorable evidence adapter matches this source and trigger basis")
+        if document.get("schema") == SEGMENTED_SCHEMA:
+            checks = _segmented_review(document, context, left, right)
+        elif document.get("schema") == CHART_SCHEMA:
+            if len(context.get("terms_segments", [])) > 1:
+                raise ValueError("Changing historical terms require segmented evidence for every effective interval")
             checks = _chart_review(document, context, left, right)
         elif outcome != "INSUFFICIENT_EVIDENCE":
             raise ValueError("No approved evidence adapter supports this outcome")
@@ -231,8 +288,12 @@ def validate_evidence(manifest, context):
                             "EXIT_IMPACT_POSSIBLE": "EXIT_IMPACT_POSSIBLE"}.get(outcome, "UNRESOLVED"),
             "evidence": [{"path": str(path), "sha256": digest,
                           "provenance": {key: provenance[key] for key in (
-                              "origin", "operator", "acquired_at", "source", "symbol", "trigger_basis", "stream_id")}}],
-            "reviewed_interval": {"start": left.isoformat(), "end": right.isoformat()}, "checks": checks,
+                              "origin", "operator", "acquired_at", "source", "symbol", "trigger_basis", "stream_id")},
+                          "source_identity": identity, "adapter": adapter}],
+            "reviewed_interval": {"start": left.isoformat() if left is not None else None,
+                                  "end": right.isoformat() if right is not None else None},
+            "historical_model_available": not context.get("historical_model_unavailable", False),
+            "checks": checks,
         }
     except (OSError, KeyError, IndexError, AttributeError, TypeError, OverflowError, sqlite3.Error) as error:
         raise ValueError(f"Protection evidence is incomplete or inaccessible: {type(error).__name__}") from error

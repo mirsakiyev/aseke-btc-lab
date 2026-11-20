@@ -23,6 +23,8 @@ VERSION = "fresh-paper-operational-health-v1"
 PREFIX = "ema-private:fresh-health:"
 META = "fresh_paper_operational_v1:"
 MAX_EVENTS = 128
+FUNDING_SCHEMA = "FUNDING_SETTLEMENT_RECONCILIATION_V1"
+FUNDING_ACTIONABLE = {"FUNDING_EVIDENCE_MISSING", "FUNDING_CONFLICT", "FINANCIAL_RECONCILIATION_BLOCKED"}
 OPEN = {"PROTECTION_INCIDENT_OPENED", "PROTECTION_GAP", "UNMODELED_TIER"}
 RECOVERED = {"PROTECTION_INCIDENT_RECOVERED", "PROTECTION_RESUMED"}
 INVALIDATES = OPEN | {"PROTECTION_INCIDENT_IMPORTED", "PROTECTION_INCIDENT_EVIDENCE_ADDED"}
@@ -31,6 +33,7 @@ EVENTS = INVALIDATES | RECOVERED | {
     "BOOK_OPERATIONAL_BLOCKED", "BOOK_OPERATIONAL_RESTORED", "OPERATIONAL_BLOCK",
     "OPERATIONAL_RESTRICTION", "OPERATIONAL_RESTORED",
     "OPERATIONAL_BLOCK_OPENED", "OPERATIONAL_BLOCK_CLEARED", "SOURCE_OPERATIONAL_TRANSITION",
+    "FUNDING_STATUS_CHANGED",
 }
 OPERATIONAL_OPEN = {"BOOK_OPERATIONAL_BLOCKED", "OPERATIONAL_BLOCK", "OPERATIONAL_RESTRICTION",
                     "OPERATIONAL_BLOCK_OPENED"}
@@ -154,10 +157,20 @@ def _exposure(book):
 
 def _blocked(book):
     position = book.get("position") or {}
+    operational = book.get("operational") or {}
+    permission = operational.get("entry_permission") or {} if isinstance(operational, dict) else {}
+    normal = {"POSITION_OPEN", "PENDING_ENTRY", "STUDY_WINDOW_CLOSED", "SESSION_CLOSED",
+              "WAIT_FUTURE_ADMISSION", "WAIT_FUTURE_CANDLE"}
+    if isinstance(permission, dict) and permission.get("available") is False:
+        if permission.get("reason_code") not in normal:
+            return str(permission.get("reason_code") or "OPERATIONAL_ENTRY_RESTRICTED")
     if book.get("state") == "BLOCKED" or book.get("permanent_block"):
         return str(book.get("reason") or position.get("unresolved_costs") or book.get("problem")
                    or "BOOK_BLOCKED")
-    if position.get("unresolved_protection") or position.get("unresolved_costs"):
+    funding = _funding_projection(book)
+    normal_pending = bool(funding and funding.get("state") == "FUNDING_SETTLEMENT_PENDING"
+                          and not funding.get("actionable"))
+    if position.get("unresolved_protection") or (position.get("unresolved_costs") and not normal_pending):
         return str(position.get("unresolved_costs") or "UNRESOLVED_PROTECTION_INTERVAL")
     # A historical problem alone must not defeat a valid prospective permit.
     if (book.get("state") != "EVIDENCE_UNAVAILABLE" and book.get("problem")
@@ -166,11 +179,62 @@ def _blocked(book):
     return None
 
 
+def _funding_projection(book):
+    value = (book.get("position") or {}).get("funding_state")
+    if value is None:
+        value = (book.get("operational") or {}).get("funding")
+    if isinstance(value, dict) and value.get("schema") == FUNDING_SCHEMA:
+        return value
+    return None
+
+
+def _funding_notice(db, now, saved, previous, body, event, *, generation, slot, identifier, book):
+    """One notice per obligation condition, independent of source/entry reasons."""
+    obligation = body.get("obligation_id") or body.get("id")
+    if not isinstance(obligation, str) or not obligation:
+        raise ValueError("Funding status event lacks an obligation identity")
+    if body.get("schema") != FUNDING_SCHEMA or body.get("book_id", identifier) != identifier:
+        raise ValueError("Funding status schema or book identity differs")
+    state = body.get("state")
+    actionable = body.get("actionable") is True or state in FUNDING_ACTIONABLE
+    conditions = previous.setdefault("funding_conditions", {})
+    prior = conditions.get(obligation, {})
+    signature = fingerprint([state, body.get("reason_code"), actionable])
+    sequence = prior.get("sequence", 0) + (prior.get("signature") != signature)
+    conditions[obligation] = {"signature": signature, "state": state, "actionable": actionable,
+                              "sequence": sequence, "reason_code": body.get("reason_code"),
+                              "event_id": event.get("key") if event else None}
+    if prior.get("signature") == signature or (not actionable and not prior.get("actionable")):
+        return None
+    resolved = not actionable
+    complete = body.get("financial_complete") is True or state in {
+        "SETTLED", "NOT_APPLICABLE", "NO_SETTLEMENT_DUE", "NOT_APPLICABLE_EXCHANGE_TIMESTAMP"}
+    title = ("FUNDING EVIDENCE RESOLVED" if complete else "FUNDING EVIDENCE IMPROVED — SETTLEMENT PENDING") if resolved else "FUNDING EVIDENCE REQUIRED"
+    exposure = _exposure(book)
+    action = ("The actionable evidence failure cleared; settlement remains pending. Position remains open; entry is occupied."
+              if resolved and not complete and exposure == "OPEN" else
+              "The actionable evidence failure cleared; settlement remains pending. Financial reconciliation is incomplete."
+              if resolved and not complete else
+              "This obligation is resolved; other prerequisites may remain. Position remains open; entry is occupied."
+              if resolved and exposure == "OPEN" else
+              "This obligation is resolved; normal financial, strategy and prospective admission checks still apply."
+              if resolved else "Inspect this exact settlement's source-correct rate and valuation evidence; protection continues independently.")
+    return _outbox(db, now, saved, ["FUNDING", obligation, sequence, signature], title,
+                   generation=generation, slot=slot, book=identifier,
+                   reason=body.get("reason_code") or state, exposure=exposure, event=event,
+                   historical=bool(book.get("historical_problem") or (book.get("position") or {}).get("unresolved_protection")),
+                   action=action)
+
+
 def _permission(db, generation, book_id, book, now, *, minimum_resume_row=0):
     if (book.get("state") != "ACTIVE" or book.get("prospective_entry_permission") is not True
             or book.get("position") or book.get("pending") or _blocked(book)):
         return False
     if (book.get("qualification") or {}).get("state") != "QUALIFIED":
+        return False
+    operational = book.get("operational")
+    if operational is not None and (not isinstance(operational, dict)
+                                   or (operational.get("entry_permission") or {}).get("available") is not True):
         return False
     marks = ",".join("?" for _ in INVALIDATES)
     last_incident = max(minimum_resume_row, db.execute(
@@ -284,7 +348,7 @@ def _source_current(source, scope_keys, now):
     return restrictions
 
 
-def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, consistent, gates):
+def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, consistent, gates, event_limit):
     key = META + fingerprint([generation, identifier])
     previous = _load(get_meta(db, key, "{}"))
     supplied = view.get("books", {}).get(slot)
@@ -334,7 +398,7 @@ def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, c
     marks = ",".join("?" for _ in EVENTS)
     rows = source.execute(f"SELECT rowid,key,kind,recorded_at,body FROM event WHERE book IN ({source_marks}) AND rowid>? "
                           f"AND kind IN ({marks}) ORDER BY rowid LIMIT ?",
-                          (*sources, previous["cursor"], *sorted(EVENTS), MAX_EVENTS)).fetchall()
+                          (*sources, previous["cursor"], *sorted(EVENTS), event_limit)).fetchall()
     notices = []
     for rowid, event_id, kind, at, encoded in rows:
         if utc(at) > now:
@@ -342,6 +406,15 @@ def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, c
         body = _load(encoded)
         incident = body.get("incident_id") or (event_id if kind in OPEN else None)
         event = {"key": event_id, "kind": kind, "rowid": rowid, "at": at, "incident": incident}
+        for field in ("episode_id", "source_scope_id", "correlation_id", "source_correlation_id", "reason_code", "restriction_started_at", "cleared_at",
+                      "obligation_id", "position_id", "settlement_due_at", "valuation_deadline", "rate_status", "valuation_status", "state", "previous_state",
+                      "historical_coverage"):
+            if body.get(field) is not None:
+                event[field] = _safe(body[field], 128)
+        if kind == "FUNDING_STATUS_CHANGED" and body.get("slot") and not event.get("settlement_due_at"):
+            event["settlement_due_at"] = _safe(body["slot"], 64)
+        if "requires_incident_review" in body:
+            event["requires_incident_review"] = body["requires_incident_review"] is True
         operational = previous.setdefault("operational_restrictions", {})
         source_transition = kind == "SOURCE_OPERATIONAL_TRANSITION"
         restricted = source_transition and (body.get("restricted") is True or body.get("active") is True
@@ -358,7 +431,13 @@ def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, c
         elif cleared:
             episode = "SOURCE_SCOPE:" + str(body.get("source_scope_id")) if source_transition else _episode(body)
             operational.pop(episode, None)
-        if kind in OPEN or kind in OPERATIONAL_OPEN or restricted:
+        funding_operation = (body.get("evidence") or {}).get("funding_status_schema") == FUNDING_SCHEMA
+        if kind == "FUNDING_STATUS_CHANGED":
+            notice = _funding_notice(db, now, saved, previous, body, event, generation=generation,
+                                     slot=slot, identifier=identifier, book=book)
+            if notice:
+                notices.append(notice)
+        elif (kind in OPEN or kind in OPERATIONAL_OPEN or restricted) and not funding_operation:
             previous.update(ever_restricted=True, entry_available=False)
             notice = _outbox(db, now, saved, ["INCIDENT", incident] if kind in OPEN else ["EVENT", event_id], "PAPER PROTECTION INCIDENT" if kind in OPEN
                              else "PAPER BOOK BLOCKED", generation=generation, slot=slot, book=identifier,
@@ -378,11 +457,28 @@ def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, c
                                   (*sources, previous["cursor"], *sorted(EVENTS))).fetchone())
     if not backlog:
         previous["cursor"] = latest
+    if not backlog and consistent and not inspection:
+        funding = _funding_projection(book)
+        if funding is not None:
+            obligations = list(funding.get("obligations") or [])
+            if len(obligations) > 512:
+                raise ValueError("Funding obligation snapshot exceeds supported bound")
+            if funding.get("actionable") and not obligations:
+                obligations = [{**funding, "id": funding.get("status_obligation_id") or
+                                fingerprint([identifier, (book.get("position") or {}).get("id"), "FUNDING_SCHEDULE"])}]
+            for obligation in obligations:
+                body = {"schema": FUNDING_SCHEMA, **obligation, "obligation_id": obligation.get("id")}
+                notice = _funding_notice(db, now, saved, previous, body, None, generation=generation,
+                                         slot=slot, identifier=identifier, book=book)
+                if notice:
+                    notices.append(notice)
     reason = _blocked(book) or next((r.get("reason") for k, r in previous["operational_restrictions"].items()
                                    if k.startswith("SOURCE_SCOPE:")), None)
     if reason:
         signature = fingerprint([book.get("state"), reason, bool(book.get("permanent_block"))])
-        if previous.get("notified_block") != signature:
+        funding = _funding_projection(book)
+        funding_reason = bool(funding and (reason in FUNDING_ACTIONABLE or reason == funding.get("reason_code")))
+        if previous.get("notified_block") != signature and not funding_reason:
             previous["episode"] += 1
             permit = book.get("prospective_admission") or {}
             effective = permit.get("effective_at") if isinstance(permit, dict) else None
@@ -422,11 +518,12 @@ def _book(db, source, now, saved, generation, slot, identifier, lane, view, *, c
     previous.update(last_scan_at=now.isoformat(), latest_rowid=latest, backlog=backlog,
                     snapshot_consistent=bool(consistent), exposure=_exposure(book), reason=reason)
     set_meta(db, key, json.dumps(previous))
-    return {**previous, "book_id": identifier, "notices": notices, "initial_baseline": initial}
+    return {**previous, "book_id": identifier, "notices": notices, "initial_baseline": initial,
+            "events_read": len(rows), "event_limit": event_limit}
 
 
 def collect(db, now, *, view=None, paper_db=None, registration=None, consistent=True, inspection_failure=None,
-            current_gates=None):
+            current_gates=None, event_limit=MAX_EVENTS, event_budget=None, max_books=None):
     """Queue operational transitions under the existing watchdog check lease.
 
     First commissioning baselines old incident events but reports a current
@@ -451,17 +548,27 @@ def collect(db, now, *, view=None, paper_db=None, registration=None, consistent=
                 after = source.execute("SELECT coalesce(max(rowid),0) FROM event").fetchone()[0]
                 return collect(db, now, view=snapshot, paper_db=source, registration=record,
                                consistent=consistent and before == after and view is None and not inspection_failure,
-                               inspection_failure=inspection_failure, current_gates=current_gates)
+                               inspection_failure=inspection_failure, current_gates=current_gates,
+                               event_limit=event_limit, event_budget=event_budget, max_books=max_books)
         except ERRORS as exc:
             return failed(db, now, "PAPER_OPERATIONAL_SCANNER_" + type(exc).__name__)
     try:
         generation, members, lanes = _members(registration, paper_db)
+        if type(event_limit) is not int or not 1 <= event_limit <= MAX_EVENTS:
+            raise ValueError("OPERATIONAL_EVENT_LIMIT_OUTSIDE_BOUND")
+        if max_books is not None and (type(max_books) is not int or not 1 <= max_books <= 64 or len(members) > max_books):
+            raise ValueError("OPERATIONAL_REGISTERED_BOOK_CAPACITY_EXCEEDED")
+        if event_budget is not None:
+            if type(event_budget) is not int or not len(members) <= event_budget <= 4096:
+                raise ValueError("OPERATIONAL_EVENT_BUDGET_OUTSIDE_BOUND")
+            event_limit = min(event_limit, event_budget // len(members))
         if not isinstance(view, dict) or view.get("generation_id") != generation or not isinstance(view.get("books"), dict):
             raise ValueError("Operational snapshot does not match registered generation")
         saved = route(db)
         gates = _current_gates(registration, lanes, now) if current_gates is None else current_gates
     except ERRORS as exc:
-        return failed(db, now, "PAPER_OPERATIONAL_SCANNER_" + type(exc).__name__)
+        reason = str(exc) if re.fullmatch(r"OPERATIONAL_[A-Z_]+", str(exc)) else "PAPER_OPERATIONAL_SCANNER_" + type(exc).__name__
+        return failed(db, now, reason)
     if not db.in_transaction:
         db.execute("BEGIN")
     results = {}
@@ -470,7 +577,7 @@ def collect(db, now, *, view=None, paper_db=None, registration=None, consistent=
         db.execute("SAVEPOINT paper_operational_book")
         try:
             results[slot] = _book(db, paper_db, now, saved, generation, slot, identifier, lanes[slot], view,
-                                  consistent=consistent, gates=gates)
+                                  consistent=consistent, gates=gates, event_limit=event_limit)
             failure = _load(get_meta(db, failure_key, "{}"))
             if failure.get("error"):
                 failure["error"] = None
@@ -496,7 +603,8 @@ def collect(db, now, *, view=None, paper_db=None, registration=None, consistent=
         b.get("state") != "CHECK_FAILED" and not b.get("inspection") for b in results.values()) else "PARTIAL",
               "version": VERSION, "checked_at": now.isoformat(), "generation_id": generation,
               "snapshot_consistent": bool(consistent), "delivery": "PRIVATE_OUTBOX" if saved else "LOCAL_ONLY_NO_PRIVATE_ROUTE",
-              "books": results, "current_gates": gates}
+              "books": results, "current_gates": gates, "event_limit": event_limit,
+              "event_budget": event_budget, "registered_book_count": len(members), "max_books": max_books}
     if inspection_failure:
         report["inspection_failure"] = inspection_failure
     set_meta(db, META + "last", json.dumps(report))

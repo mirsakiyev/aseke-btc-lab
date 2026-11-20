@@ -3,10 +3,12 @@
 from contextlib import closing
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
 
 import pandas as pd
+from lab import runtime_snapshot
 import psutil
 
 from lab.storage import read_json, utc, utc_now, writer_lock
@@ -28,13 +30,32 @@ def _checked_process(process, project, executable_paths, user):
             and process.cmdline()[1:] == ARGS)
 
 
-def _flat(root):
+def _flat(root, *, generation_id=None):
+    from lab.paper_run import membership
+    from lab.phase13.registry import sealed
+
+    root = Path(root).resolve()
+    identifier = read_json(root / "current.json")["id"]
+    if not re.fullmatch(r"[0-9a-f]{64}", identifier) or (generation_id is not None and identifier != generation_id):
+        raise ValueError("CURRENT_RUNNER_REGISTERED_GENERATION_MISMATCH")
+    record = sealed(root / "registrations" / f"{identifier}.json", identifier)
+    retirement = sealed(root / "legacy-retired.json")
+    if (record["body"].get("protocol") != "fresh-reference-paper-v2"
+            or record["body"].get("archive_id") != retirement["id"]):
+        raise ValueError("CURRENT_RUNNER_REGISTERED_RETIREMENT_MISMATCH")
     path = (root / "paper.sqlite3").resolve()
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)) as db:
         db.execute("BEGIN")
-        states = [json.loads(raw) for raw, in db.execute("SELECT state FROM book")]
-        if len(states) != 7:
-            raise ValueError("Unexpected number of current books")
+        # Reference amendment fields do not alter membership. Passing False
+        # deliberately avoids consulting a different global gate.ROOT when a
+        # reviewed helper verifies an explicitly supplied ledger directory.
+        registered = membership.expected_book_ids(record, False, db=db)
+        rows = db.execute("SELECT id,state FROM book").fetchall()
+        if {key for key, _ in rows} != registered:
+            raise ValueError("CURRENT_RUNNER_REGISTERED_MEMBERSHIP_MISMATCH")
+        states = [json.loads(raw) for _, raw in rows]
+        if any(state.get("book_id") != key for (key, _), state in zip(rows, states)):
+            raise ValueError("CURRENT_RUNNER_BOOK_STATE_IDENTITY_MISMATCH")
         return all(state["position"] is None and state["pending"] is None for state in states)
 
 
@@ -42,15 +63,18 @@ def if_needed(root, generation_id, amendment_id, *, project, clock=utc_now, look
     """Restart only the verified old runner, while financing state is fenced and flat."""
     root, project = Path(root).resolve(), Path(project).resolve()
     cycle_path = root / "last-cycle.json"
-    if not amendment_id or not cycle_path.is_file():
+    if not amendment_id:
         return None
     try:
-        heartbeat = read_json(cycle_path)
+        legacy_cycle = lambda: read_json(cycle_path) if cycle_path.is_file() else None
+        heartbeat = runtime_snapshot.read(cycle_path, legacy_cycle)
+        if heartbeat is None:
+            return None
         if heartbeat.get("source_amendment_id") == amendment_id and (
                 expected_build is None or heartbeat.get("runner_build_id") == expected_build):
             return None
         with writer_lock(root / ".writer.lock"):
-            heartbeat = read_json(cycle_path)
+            heartbeat = runtime_snapshot.read(cycle_path, legacy_cycle)
             if heartbeat.get("source_amendment_id") == amendment_id and (
                     expected_build is None or heartbeat.get("runner_build_id") == expected_build):
                 return None
@@ -62,7 +86,7 @@ def if_needed(root, generation_id, amendment_id, *, project, clock=utc_now, look
             maximum_age = pd.Timedelta(minutes=15) if expected_build else HEARTBEAT_AGE
             if not pd.Timedelta(0) <= now - observed <= maximum_age:
                 return _blocked("CURRENT_RUNNER_HEARTBEAT_STALE")
-            if not _flat(root):
+            if not _flat(root, generation_id=generation_id):
                 return _blocked("CURRENT_BOOK_HAS_EXPOSURE_OR_PENDING_IDEA")
             launch = read_json(root / "last-launch.json")
             launched = utc(launch["at"])

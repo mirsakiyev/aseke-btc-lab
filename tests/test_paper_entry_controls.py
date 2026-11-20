@@ -1,5 +1,6 @@
 import json
 import sys
+from hashlib import sha256
 
 import pandas as pd
 import pytest
@@ -88,6 +89,24 @@ def test_generation_is_rechecked_under_the_writer_lease(controls, monkeypatch):
     with pytest.raises(ValueError, match="generation"):
         operator.entries_on(GENERATION, approve=True)
     assert controls.exists()
+
+
+def test_approved_pause_digest_is_rechecked_under_the_writer_lease(controls, monkeypatch):
+    digest = sha256(controls.read_bytes()).hexdigest()
+    assert operator.entries_on(GENERATION, expected_pause_sha256=digest)["pause_sha256"] == digest
+    original = operator._entry_pause
+    reads = iter((False, True))
+
+    def replaced_pause(generation, now):
+        if next(reads):
+            write_json(controls, {"generation": GENERATION, "paused_at": NOW.isoformat()})
+        return original(generation, now)
+
+    monkeypatch.setattr(operator, "_entry_pause", replaced_pause)
+    with pytest.raises(ValueError, match="approved SHA-256"):
+        operator.entries_on(GENERATION, approve=True, expected_pause_sha256=digest)
+    assert controls.exists()
+    assert not (gate.ROOT / "entries-controls").exists()
 
 
 def test_audit_write_failure_keeps_pause_in_place(controls, monkeypatch):

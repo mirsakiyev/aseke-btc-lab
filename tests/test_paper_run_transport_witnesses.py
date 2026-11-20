@@ -114,7 +114,7 @@ def test_owner_captures_websocket_close_frames_before_reconnecting(monkeypatch):
     assert disconnected["exception"]["cause"]["type"] == "TimeoutError"
 
 
-def test_failed_consumer_work_keeps_witness_pending_and_retry_is_idempotent(generation, monkeypatch):
+def test_committed_witness_survives_consumer_failure_and_retry_is_idempotent(generation, monkeypatch):
     record, now = generation
     amendment = source_amendment.install(record, QUALIFICATION, now=APPROVED)
     lane = source_amendment.lanes(record, amendment)[DAY]
@@ -126,9 +126,14 @@ def test_failed_consumer_work_keeps_witness_pending_and_retry_is_idempotent(gene
     witnesses = feed.pending_witnesses()
     apply = runtime._apply_live_point
     monkeypatch.setattr(runtime, "_apply_live_point", lambda *_: (_ for _ in ()).throw(RuntimeError("fixture")))
-    with pytest.raises(RuntimeError, match="fixture"):
-        runtime.live_prices(record, amendment, [], {}, witnesses=witnesses)
+    # The source cause commits independently of per-book processing. A failed
+    # consumer cannot roll that evidence back or stop another book's protection.
+    accepted = runtime.live_prices(record, amendment, [], {}, witnesses=witnesses)
+    assert accepted == [item["id"] for item in witnesses]
     assert feed.pending_witnesses() == witnesses
+    with closing(runtime.connect(readonly=True)) as db:
+        assert len(protection_incidents.project(db, lane["book_id"])) == 1
+        assert db.execute("SELECT 1 FROM event WHERE kind='OPERATIONAL_BLOCK_OPENED'").fetchone()
     monkeypatch.setattr(runtime, "_apply_live_point", apply)
     accepted = runtime.live_prices(record, amendment, [], {}, witnesses=feed.pending_witnesses())
     feed.acknowledge_witnesses(accepted)

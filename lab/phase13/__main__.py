@@ -68,6 +68,7 @@ def _managed_observe(launch):
     from pathlib import Path
     from lab.phase10.observer import ObservationAudit
     from lab.phase10.repair_guard import _lease
+    from lab import runtime_snapshot
 
     project = Path(__file__).resolve().parents[2]
     state = project / "data" / "phase10"
@@ -76,7 +77,8 @@ def _managed_observe(launch):
         with audit.stage("ownership"):
             import psutil
 
-            worker = json.loads((state / "runtime.json").read_text(encoding="utf-8"))
+            checkpoint = state / "runtime.json"
+            worker = runtime_snapshot.read(checkpoint, lambda: json.loads(checkpoint.read_text(encoding="utf-8")))
             if (not any(parent.pid == worker["pid"] and parent.create_time() == worker["created"]
                         for parent in psutil.Process().parents()) or worker["launch_id"] != launch):
                 raise ValueError("Managed observation requires the current task worker as its ancestor")

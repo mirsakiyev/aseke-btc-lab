@@ -224,6 +224,17 @@ def test_legacy_import_preserves_unknown_first_recovery_and_prior_events(lifecyc
         assert db.execute("SELECT key,body FROM event WHERE kind='PROTECTION_GAP'").fetchone() == original
 
 
+def test_protection_command_rejects_generation_changed_before_writer_lease(lifecycle, monkeypatch):
+    record, _, _, lane = lifecycle
+    command = request(record, lane, "activation-racing-reset")
+    generations = iter((record, {**record, "id": "a" * 64}))
+    monkeypatch.setattr(runtime, "current", lambda: next(generations))
+    monkeypatch.setattr(runtime, "connect", lambda: pytest.fail("Obsolete command opened the financial DB"))
+
+    with pytest.raises(ValueError, match="generation changed"):
+        commands.execute("activate", command, apply=True, authorized=True)
+
+
 def test_activation_and_resume_fail_closed_on_exposure_or_unqualified_health(lifecycle, monkeypatch):
     record, now, _, lane = lifecycle
     command = request(record, lane, "activate-open")
@@ -237,7 +248,7 @@ def test_activation_and_resume_fail_closed_on_exposure_or_unqualified_health(lif
     with pytest.raises(ValueError, match="clock"):
         commands._healthy(record, lane)
     monkeypatch.setattr(runtime, "synchronized", lambda _: True)
-    monkeypatch.setattr(runtime, "status", lambda: {"ema_live_feed": {"state": "BACKOFF"}})
+    monkeypatch.setattr(runtime, "read_status_snapshot", lambda name, _: {"state": "BACKOFF"})
     with pytest.raises(ValueError, match="not streaming"):
         commands._healthy(record, lane)
 

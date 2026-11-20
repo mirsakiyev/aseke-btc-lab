@@ -39,23 +39,32 @@ def active(record):
 
 def install(record, qualification, *, now=None):
     now = utc_now() if now is None else now
+    with writer_lock(gate.ROOT / ".writer.lock"):
+        if gate.reset_pending():
+            raise ValueError("Resume the pending generation reset before amending its source")
+        pointer = gate.ROOT / "current.json"
+        if pointer.exists() and read_json(pointer)["id"] != record["id"]:
+            raise ValueError("The requested generation is no longer current")
+        return _install_locked(record, qualification, now=now)
+
+
+def _install_locked(record, qualification, *, now):
     if qualification.get("state") != "QUALIFIED":
         raise ValueError("A sustained Kraken trade-stream qualification is required")
-    with writer_lock(gate.ROOT / ".writer.lock"):
-        if prior := active(record):
-            return prior
-        effective = now.floor("min") + pd.Timedelta(minutes=1)
-        books = _clocks(record)
-        if any(effective >= utc(book["publication_end_exclusive"]) for book in books.values()):
-            raise ValueError("An EMA publication horizon has already elapsed")
-        body = {"protocol": PROTOCOL, "generation": record["id"], "books": books,
-                "registered_at": now.isoformat(), "effective_at": effective.isoformat(),
-                "source": ema.SOURCE, "symbol": ema.SYMBOL, "endpoint": ENDPOINT, "freshness_seconds": 2,
-                "observation_kind": execution.WS_TRADE, "qualification": qualification}
-        amendment = {"id": fingerprint(body), "body": body}
-        write_json(gate.ROOT / "source-amendments" / f"{amendment['id']}.json", amendment)
-        write_json(gate.ROOT / "ema-live-source.json", {"id": amendment["id"]})
-        return amendment
+    if prior := active(record):
+        return prior
+    effective = now.floor("min") + pd.Timedelta(minutes=1)
+    books = _clocks(record)
+    if any(effective >= utc(book["publication_end_exclusive"]) for book in books.values()):
+        raise ValueError("An EMA publication horizon has already elapsed")
+    body = {"protocol": PROTOCOL, "generation": record["id"], "books": books,
+            "registered_at": now.isoformat(), "effective_at": effective.isoformat(),
+            "source": ema.SOURCE, "symbol": ema.SYMBOL, "endpoint": ENDPOINT, "freshness_seconds": 2,
+            "observation_kind": execution.WS_TRADE, "qualification": qualification}
+    amendment = {"id": fingerprint(body), "body": body}
+    write_json(gate.ROOT / "source-amendments" / f"{amendment['id']}.json", amendment)
+    write_json(gate.ROOT / "ema-live-source.json", {"id": amendment["id"]})
+    return amendment
 
 
 def lanes(record, amendment):

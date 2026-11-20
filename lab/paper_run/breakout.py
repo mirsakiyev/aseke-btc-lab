@@ -94,21 +94,33 @@ def entry_terms(book, lane, plan, metadata, config, price, now):
                   "target": paper.fixed_target(price, stop, plan["target_r"], 1, contract.price_tick)}
 
 
-def trail(db, book, lane, now):
-    record, step = book["position"], pd.Timedelta(hours=4)
+def trail_identity(book, lane, now):
+    record = book["position"]
     if lane["exit"] != "atr_trail_v1" or record.get("exit_observed"):
-        return
+        return None
     check = now.floor(catalog.STEP).isoformat()
     if record.get("trail_check") == check:
-        return
-    record["trail_check"] = check
+        return None
+    return record["id"], check, record.get("trail_check"), record.get("last_trail")
+
+
+def trail_inputs(book, lane, now):
+    """Read only completed candle evidence, for the frozen trailing decision."""
+    record, step = book["position"], pd.Timedelta(hours=4)
     end = now.floor(step)
     start = max(utc(record["entry_at"]), end - step)
     if end <= start or (record["last_trail"] and utc(record["last_trail"]) >= end):
-        return
+        return ()
     rows = swing_trails(lane, start, end, now)
-    proposals = [row for row in rows.values() if utc(record["entry_at"]) < utc(row["close_at"])
-                 and utc(row["available_at"]) <= now and (not record["last_trail"] or utc(record["last_trail"]) < utc(row["close_at"]))]
+    return tuple(row for row in rows.values() if utc(record["entry_at"]) < utc(row["close_at"])
+                 and utc(row["available_at"]) <= now and (not record["last_trail"] or utc(record["last_trail"]) < utc(row["close_at"])))
+
+
+def apply_trail(db, book, lane, now, identity, proposals):
+    if trail_identity(book, lane, now) != identity:
+        return
+    record = book["position"]
+    record["trail_check"] = identity[1]
     for row in sorted(proposals, key=lambda item: item["close_at"]):
         side = record["plan"]["direction"]
         tick = record["plan"]["contract"]["price_tick"]
@@ -118,6 +130,18 @@ def trail(db, book, lane, now):
         record["last_trail"] = row["close_at"]
         record["stop_effective_at"] = now.isoformat()
         paper.event(db, book, "TRAIL_UPDATED", record["id"], now, now, {**row, "effective_stop": record["stop"]})
+
+
+def trail(db, book, lane, now):
+    identity = trail_identity(book, lane, now)
+    if identity is None:
+        return
+    try:
+        proposals = trail_inputs(book, lane, now)
+    except Exception:
+        book["position"]["trail_check"] = identity[1]
+        raise
+    apply_trail(db, book, lane, now, identity, proposals)
 
 
 def settled(body, start, end, now):
